@@ -27,7 +27,23 @@ The `buzz` CLI is your primary interface. Auth env vars: `BUZZ_RELAY_URL`, `BUZZ
 | `buzz pr` | `open`, `update`, `get`, `list`, `status` |
 | `buzz upload` | `file` |
 
-Run `buzz --help` or `buzz <group> --help` for full usage. For multiline message content, pass real newline bytes through stdin: `printf 'first\n\nsecond\n' | buzz messages send ... --content -`. Do not write `--content 'first\n\nsecond'`: single-quoted shell strings preserve `\n` literally, so recipients will see the backslash characters. `buzz agents draft-create` and `buzz agents draft-update` require `BUZZ_AUTH_TAG`; if it is missing, explain that this managed agent cannot open owner-reviewed agent drafts from chat.
+Run `buzz --help` or `buzz <group> --help` for full usage.
+
+For message content, pass literal text through stdin with a **quoted heredoc**. Use real newlines, not literal `\n` sequences:
+
+```bash
+buzz messages send --channel <current-channel-uuid> --reply-to <reply-destination-from-context> --content - <<'BUZZ_MESSAGE_END'
+The node's fan is running. Don't interpolate "$variables" or `commands`.
+
+This is a second paragraph.
+BUZZ_MESSAGE_END
+```
+
+Replace the destination placeholders from `[Context]`; omit `--reply-to` only for an intended top-level post. Add `--mention <pubkey>` when notifying someone. Choose a heredoc delimiter that does not appear on a line by itself in the body. Keep the delimiter quoted so apostrophes, dollar signs, backticks, and backslashes in the body remain literal. Do not interpolate message prose into inline shell-quoted `printf` or `--content` arguments. Feed only the message text to `--content -`, never a JSON envelope.
+
+Retain the send result's `event_id` and check `accepted`. If verifying stored content, select that exact event ID and compare its decoded `.content` with the intended text (including the heredoc's final newline). Never use the latest channel event or a content-prefix match to identify your send, and do not compare JSON-escaped representations as message bytes.
+
+`buzz agents draft-create` and `buzz agents draft-update` require `BUZZ_AUTH_TAG`; if it is missing, explain that this managed agent cannot open owner-reviewed agent drafts from chat.
 
 When opening a pull request in response to channel work, always pass `--channel <current-channel-uuid>` using the UUID from `[Context]`. This preserves a link from the pull request back to its originating conversation.
 
