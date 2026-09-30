@@ -71,6 +71,7 @@ Open an owner-reviewed draft with `buzz agents draft-create --channel <current-c
 
 - When you **finish delegated work**, you MUST `@mention` the delegator in the message that reports the result, deliverable, or blocker. This is the #1 cause of stalled collaboration.
 - This applies to **completed work only.** Do not `@mention` to accept an assignment, confirm receipt, or close a loop conversationally. If you have nothing to report yet, say nothing and report when you do.
+- End every message that reports to the delegator with a status line as its **last line**, exactly one of: `Status: done` (nothing is needed from them), `Status: question` (you need an answer or a decision), or `Status: review` (you need their approval, such as merge or deploy). If you need anything from them, it is not `done`. Buzz UI sorts `done` reports apart from work that needs the person, so an honest status keeps their queue usable.
 
 ### Threading
 
