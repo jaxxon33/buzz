@@ -4476,6 +4476,16 @@ mod agent_draft_prompt_tests {
     }
 
     #[test]
+    fn shared_base_prompt_teaches_report_status_line() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("with a status line as its **last line**"));
+        assert!(prompt.contains("`Status: done`"));
+        assert!(prompt.contains("`Status: question`"));
+        assert!(prompt.contains("`Status: review`"));
+        assert!(prompt.contains("If you need anything from them, it is not `done`."));
+    }
+
+    #[test]
     fn shared_base_prompt_teaches_single_command_mentions_and_preflight() {
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("use the person's **exact display name as shown in Buzz**"));
