@@ -4,6 +4,26 @@ This guide is for AI agents contributing to the Buzz codebase. It covers
 agent-specific context and conventions. For general contributor info (setup,
 code style, PR process, architecture), see [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Owned fork
+
+This checkout is **jaxxon33/buzz** (https://github.com/jaxxon33/buzz), our relay.
+It was forked from Block's `block/buzz` and frozen on 2026-10-03. Hive 2 uses
+this repo as its backend.
+
+- Our line is `09d711183dc2501e23b330852be66f04d9d9725f` on `origin/main`.
+  The commits that are ours are the ACP message-stdin and report-status docs,
+  plus their two merge commits.
+- Block's `main` at the freeze was `33f54de2dd27a8f6bce0d359183f5ebe5f2fa9ba`.
+  That tip is 357 commits we are not taking. We are 4 commits ahead of the
+  common ancestor.
+
+Do not fetch, merge, or rebase `block/buzz`. Do not re-add an `upstream`
+remote. New relay work lands on `jaxxon33/buzz` only.
+
+The rest of this guide still describes Block's upstream project. Where it
+says `block/buzz`, read `jaxxon33/buzz` for our line. Ignore Block's release,
+ECR, and Artifactory flow.
+
 ---
 
 ## Product Contract
