@@ -57,7 +57,10 @@ and Docker. Check that the pilot is idle before stopping it. Keep the existing
 service's environment file in place; the controller forwards an explicit list
 of only that agent's settings, using variable **names**, not values, in argv.
 Its HOME, PATH, commands and base-prompt paths come from the image. No credentials
-are printed or written to a new file by this controller.
+are printed or written to a new file by this controller. The host resolves the
+configured relay hostname at each launch and supplies that single host mapping
+to Docker, so private/Tailscale DNS works without sharing host networking. The
+original hostname is retained for TLS verification.
 
 ```bash
 python3 deploy/agent-isolation/pilot.py activate \

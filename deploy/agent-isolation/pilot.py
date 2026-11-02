@@ -7,9 +7,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 
 NAME = "buzz-isolated-gemma"
 VOLUME = NAME + "-workspace"
@@ -86,6 +88,13 @@ def start(image):
     if not required.issubset(os.environ) or os.environ.get("BUZZ_AGENT_PROVIDER") != "openai":
         raise ValueError("Pilot requires its own complete OpenAI-compatible environment")
     args = runtime_args(image)
+    # Docker's default resolver cannot resolve the host's private/Tailscale DNS.
+    # Resolve only the configured relay on the trusted host, retaining its TLS name.
+    host = urlsplit(os.environ["BUZZ_RELAY_URL"]).hostname
+    if not host:
+        raise ValueError("Relay URL must have a hostname")
+    address = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)[0][4][0]
+    args += ["--add-host", f"{host}:{address}"]
     # Pass variable names, never secret values in the process argument list.
     for key in sorted(FORWARDED.intersection(os.environ)):
         args += ["--env", key]
