@@ -104,7 +104,7 @@ def activate(image, source_env):
     script = Path(__file__).resolve()
     source_env = Path(source_env).resolve(strict=True)
     # Fixed pilot scope; never accepts a user-provided service, mount, or command.
-    if any(c in str(p) for p in (script, source_env) for c in '\n\r%"\\'):
+    if any(c in str(p) for p in (script, source_env) for c in ' \t\n\r%"\\'):
         raise ValueError("Unsupported character in unit path")
     unit_dir = Path.home() / ".config/systemd/user"
     unit = unit_dir / (NAME + ".service")
@@ -123,7 +123,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-EnvironmentFile="{source_env}"
+EnvironmentFile={source_env}
 ExecStart=/usr/bin/python3 "{script}" run --image {image}
 ExecStop=/usr/bin/docker stop --time 25 {NAME}
 Restart=on-failure

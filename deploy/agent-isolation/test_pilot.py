@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -39,6 +40,12 @@ class MigrationJourney(unittest.TestCase):
 
                 def service(*args):
                     calls.append(args)
+                    if args == ("daemon-reload",):
+                        unit = home / ".config/systemd/user" / (pilot.NAME + ".service")
+                        if unit.exists() and shutil.which("systemd-analyze"):
+                            parsed = subprocess.run(["systemd-analyze", "--user", "verify", str(unit)],
+                                                    capture_output=True, text=True, timeout=20)
+                            self.assertNotIn("path is not absolute", parsed.stderr)
                     if args[:2] == ("show", "buzz-acp@gemma.service"):
                         value = "active" if "--property=ActiveState" in args else old_pid
                         return subprocess.CompletedProcess(args, 0, stdout=value + "\n")
