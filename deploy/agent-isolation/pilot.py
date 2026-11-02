@@ -13,6 +13,8 @@ import sys
 import time
 from urllib.parse import urlsplit
 
+from relay_tunnel import Tunnel
+
 NAME = "buzz-isolated-gemma"
 VOLUME = NAME + "-workspace"
 LABEL = "buzz.isolation.pilot=gemma"
@@ -50,6 +52,7 @@ def runtime_args(image, name=NAME, volume=VOLUME, entrypoint=None, network="brid
             "--security-opt", "no-new-privileges:true", "--read-only",
             "--pids-limit", "256", "--memory", "2g", "--cpus", "2",
             "--network", network,
+            "--sysctl", "net.ipv4.ip_unprivileged_port_start=0",
             "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777",
             "--tmpfs", "/run:rw,noexec,nosuid,nodev,size=16m,mode=755",
             "--mount", f"type=volume,source={volume},target=/workspace",
@@ -74,6 +77,8 @@ def build(context, binary_dir, prompt):
         hashes[name] = hashlib.sha256(destination.read_bytes()).hexdigest()
     shutil.copyfile(prompt, context / "base-prompt.md")
     shutil.copyfile(Path(__file__).with_name("Dockerfile"), context / "Dockerfile")
+    for name in ("contained.py", "relay_tunnel.py"):
+        shutil.copyfile(Path(__file__).with_name(name), context / name)
     (context / "manifest.json").write_text(json.dumps(hashes, indent=2) + "\n")
     docker(["build", "--tag", NAME + ":pilot", str(context)], timeout=600)
     result = docker(["image", "inspect", "--format", "{{.Id}}", NAME + ":pilot"],
@@ -94,11 +99,22 @@ def start(image):
     if not host:
         raise ValueError("Relay URL must have a hostname")
     address = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)[0][4][0]
-    args += ["--add-host", f"{host}:{address}"]
+    args += ["--add-host", f"{host}:127.0.0.1"]
     # Pass variable names, never secret values in the process argument list.
     for key in sorted(FORWARDED.intersection(os.environ)):
         args += ["--env", key]
-    os.execvp("docker", ["docker", *args, image])
+    bridge = docker(["network", "inspect", "bridge", "--format",
+                     "{{(index .IPAM.Config 0).Gateway}}"], capture_output=True, text=True).stdout.strip()
+    # The host's Tailscale listener rejects connections arriving on docker0.
+    # This fixed-destination TCP hop is bound only to docker0, never a public IP.
+    # A second hop inside the worker retains the original relay URL and TLS name.
+    with Tunnel((bridge, 0), (address, 443)) as tunnel:
+        port = tunnel.start()
+        args += ["--env", "BUZZ_PILOT_RELAY_TARGET=" + json.dumps([bridge, port])]
+        try:
+            return subprocess.call(["docker", *args, image])
+        finally:
+            tunnel.shutdown()
 
 
 def systemctl(*args):
@@ -118,7 +134,10 @@ def activate(image, source_env):
     unit_dir = Path.home() / ".config/systemd/user"
     unit = unit_dir / (NAME + ".service")
     if unit.exists():
-        raise ValueError("Pilot unit already exists; inspect before changing it")
+        if unit.is_symlink() or "Description=Isolated Gemma pilot" not in unit.read_text():
+            raise ValueError("Refusing to overwrite an unknown pilot unit")
+        if systemctl("show", NAME + ".service", "--property=ActiveState", "--value").stdout.strip() != "inactive":
+            raise ValueError("Pilot unit already exists and is not stopped")
     state = systemctl("show", "buzz-acp@gemma.service", "--property=ActiveState", "--value").stdout.strip()
     if state != "active":
         raise ValueError("Expected the original Gemma service to be active before migration")
@@ -205,7 +224,7 @@ def main():
     if args.command == "build":
         build(args.context, args.binary_dir, args.prompt)
     elif args.command == "run":
-        start(args.image)
+        raise SystemExit(start(args.image))
     elif args.command == "activate":
         activate(args.image, args.env_file)
     else:

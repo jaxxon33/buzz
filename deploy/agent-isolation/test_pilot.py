@@ -3,6 +3,8 @@ import importlib.util
 import json
 import os
 import shutil
+import socket
+import threading
 from pathlib import Path
 import subprocess
 import tempfile
@@ -25,6 +27,40 @@ class Configuration(unittest.TestCase):
             "BUZZ_ACP_LAUNCH_PREFIX", "BUZZ_ACP_AGENT_COMMAND",
             "BUZZ_ACP_MCP_COMMAND", "BUZZ_ACP_BASE_PROMPT_FILE", "HTTP_PROXY",
         }))
+
+
+class RelayTransportJourney(unittest.TestCase):
+    def test_opaque_relay_bytes_round_trip_without_destination_selection(self):
+        with socket.socket() as upstream:
+            upstream.bind(("127.0.0.1", 0))
+            upstream.listen(1)
+            upstream.settimeout(5)
+
+            def echo():
+                connection, _ = upstream.accept()
+                with connection:
+                    connection.settimeout(5)
+                    while data := connection.recv(65536):
+                        connection.sendall(data)
+
+            worker = threading.Thread(target=echo, daemon=True)
+            worker.start()
+            with pilot.Tunnel(("127.0.0.1", 0), upstream.getsockname()) as tunnel:
+                port = tunnel.start()
+                payload = bytes(range(256)) * 1024
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
+                        client.sendall(payload)
+                        received = b""
+                        while len(received) < len(payload):
+                            part = client.recv(65536)
+                            self.assertTrue(part)
+                            received += part
+                        self.assertEqual(received, payload)
+                finally:
+                    tunnel.shutdown()
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
 
 
 class MigrationJourney(unittest.TestCase):

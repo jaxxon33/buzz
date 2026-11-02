@@ -58,9 +58,12 @@ service's environment file in place; the controller forwards an explicit list
 of only that agent's settings, using variable **names**, not values, in argv.
 Its HOME, PATH, commands and base-prompt paths come from the image. No credentials
 are printed or written to a new file by this controller. The host resolves the
-configured relay hostname at each launch and supplies that single host mapping
-to Docker, so private/Tailscale DNS works without sharing host networking. The
-original hostname is retained for TLS verification.
+configured relay hostname at each launch. Because Tailscale binds its listener
+to its own interface, the host forwards opaque TCP bytes from an ephemeral
+docker0-only port to that one relay. An unprivileged loopback hop inside the
+container connects to it. The original relay URL, TLS name and certificate
+verification remain unchanged. No host network namespace is shared with Gemma.
+The forwarding code limits concurrent connections to 16 and never decrypts TLS.
 
 ```bash
 python3 deploy/agent-isolation/pilot.py activate \

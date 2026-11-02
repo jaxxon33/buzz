@@ -8,10 +8,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir /workspace && chown 61021:61021 /workspace
 COPY --chmod=0555 bin/ /opt/buzz/bin/
 COPY --chmod=0444 base-prompt.md /opt/buzz/base-prompt.md
+COPY --chmod=0444 contained.py relay_tunnel.py /opt/buzz/
 ENV HOME=/workspace PATH=/opt/buzz/bin:/usr/local/bin:/usr/bin:/bin \
     BUZZ_NEST=/workspace BUZZ_ACP_AGENT_COMMAND=/opt/buzz/bin/buzz-agent \
     BUZZ_ACP_AGENT_ARGS="" BUZZ_ACP_MCP_COMMAND=/opt/buzz/bin/buzz-dev-mcp \
     BUZZ_ACP_BASE_PROMPT_FILE=/opt/buzz/base-prompt.md
 USER 61021:61021
 WORKDIR /workspace
-ENTRYPOINT ["/opt/buzz/bin/buzz-acp"]
+ENTRYPOINT ["python3", "/opt/buzz/contained.py"]
