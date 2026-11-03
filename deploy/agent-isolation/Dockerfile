@@ -3,8 +3,8 @@ FROM python:3.12-slim@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142
 ARG WORKER_UID=61021
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates git ripgrep tree procps openssh-client \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid ${WORKER_UID} buzz-worker \
+    && rm -rf /var/lib/apt/lists/*
+RUN groupadd --gid ${WORKER_UID} buzz-worker \
     && useradd --uid ${WORKER_UID} --gid ${WORKER_UID} --home-dir /workspace --no-create-home buzz-worker \
     && mkdir /workspace && chown ${WORKER_UID}:${WORKER_UID} /workspace
 COPY --chmod=0555 bin/ /opt/buzz/bin/

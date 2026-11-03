@@ -16,6 +16,7 @@ import time
 from urllib.parse import urlsplit
 
 from relay_tunnel import Tunnel
+import workspace
 
 NAME = "buzz-isolated-gemma"
 VOLUME = NAME + "-workspace"
@@ -24,19 +25,30 @@ AGENT = "gemma"
 DISPLAY_NAME = "Gemma"
 UID = 61021
 ORIGINAL_SERVICE = "buzz-acp@gemma.service"
+PROFILES = {
+    "gemma": (61021, "Gemma"), "fizz": (61022, "Fizz"),
+    "bolt": (61023, "Bolt"), "bumble": (61024, "Bumble"),
+    "deep": (61025, "DeepSeek V4.1 Flash"), "dew": (61026, "Dew"),
+    "glm": (61027, "GLM"), "glm-flash": (61028, "GLM 5.3 Flash"),
+    "honey": (61029, "Honey"), "kimi": (61030, "Kimi K3"),
+    "lightning": (61031, "Lightning"), "nectar": (61032, "Nectar"),
+    "nora": (61033, "Nora"), "north": (61034, "North"),
+    "omni": (61035, "Omni"), "spark": (61036, "Spark"),
+    "venice": (61037, "Venice"),
+}
+WORKSPACE_ROOT = Path('/home/paul/buzz/nests')
 
 
 def configure(agent):
-    """Only these two explicitly provisioned identities can use this controller."""
+    """Only explicitly authorised buzz-agent profiles can use this controller."""
     global AGENT, DISPLAY_NAME, NAME, VOLUME, LABEL, UID, ORIGINAL_SERVICE
-    if agent not in {"gemma", "fizz"}:
+    if agent not in PROFILES:
         raise ValueError("Unsupported isolation pilot")
     AGENT = agent
-    DISPLAY_NAME = agent.title()
+    UID, DISPLAY_NAME = PROFILES[agent]
     NAME = "buzz-isolated-" + agent
     VOLUME = NAME + "-workspace"
     LABEL = "buzz.isolation.pilot=" + agent
-    UID = {"gemma": 61021, "fizz": 61022}[agent]
     ORIGINAL_SERVICE = "buzz-acp@" + agent + ".service"
 
 # No ambient host environment, proxy configuration, remote MCP or SSH is forwarded.
@@ -49,6 +61,8 @@ FORWARDED = frozenset({
     "BUZZ_AGENT_PROVIDER", "OPENAI_COMPAT_BASE_URL", "OPENAI_COMPAT_MODEL",
     "OPENAI_COMPAT_API_KEY", "OPENAI_COMPAT_API",
     "BUZZ_ACP_CONTEXT_MESSAGE_LIMIT", "BUZZ_ACP_TEAM_INSTRUCTIONS",
+    "BUZZ_ACP_RESPOND_TO_ALLOWLIST", "OPENROUTER_API_KEY",
+    "OPENROUTER_BASE_URL", "OPENROUTER_MODEL", "BUZZ_AGENT_MODEL",
     "BUZZ_AGENT_THINKING_EFFORT", "BUZZ_AGENT_MAX_OUTPUT_TOKENS",
     "BUZZ_AGENT_MAX_CONTEXT_TOKENS", "BUZZ_AGENT_REQUIRE_REPLY",
 })
@@ -154,10 +168,16 @@ Host ag
 
 
 def start(image):
-    required = {"BUZZ_PRIVATE_KEY", "BUZZ_RELAY_URL", "OPENAI_COMPAT_API_KEY",
-                "OPENAI_COMPAT_BASE_URL", "OPENAI_COMPAT_MODEL"}
-    if not required.issubset(os.environ) or os.environ.get("BUZZ_AGENT_PROVIDER") != "openai":
-        raise ValueError("Pilot requires its own complete OpenAI-compatible environment")
+    required = {"BUZZ_PRIVATE_KEY", "BUZZ_RELAY_URL"}
+    provider_name = os.environ.get("BUZZ_AGENT_PROVIDER")
+    if provider_name == "openai":
+        required |= {"OPENAI_COMPAT_API_KEY", "OPENAI_COMPAT_BASE_URL", "OPENAI_COMPAT_MODEL"}
+    elif provider_name == "openrouter":
+        required |= {"OPENROUTER_API_KEY", "OPENROUTER_MODEL"}
+    else:
+        raise ValueError("Pilot supports only the existing openai/openrouter providers")
+    if not all(os.environ.get(key) for key in required):
+        raise ValueError("Pilot requires its own complete provider environment")
     desktop_profile = docker(["image", "inspect", image, "--format",
                               '{{index .Config.Labels "buzz.isolation.desktop"}}'],
                              capture_output=True, text=True).stdout.strip()
@@ -182,8 +202,8 @@ def start(image):
         port = tunnel.start()
         cleanup.callback(tunnel.shutdown)
         args += ["--env", "BUZZ_PILOT_RELAY_TARGET=" + json.dumps([bridge, port])]
-        provider = urlsplit(os.environ["OPENAI_COMPAT_BASE_URL"])
         if AGENT == "fizz":
+            provider = urlsplit(os.environ["OPENAI_COMPAT_BASE_URL"])
             if (provider.scheme, provider.hostname, provider.port) != ("http", "127.0.0.1", 8100):
                 raise ValueError("Fizz pilot requires its existing local model service")
             model_tunnel = cleanup.enter_context(Tunnel((bridge, 0), ("127.0.0.1", 8100)))
@@ -200,10 +220,40 @@ def systemctl(*args):
     return run(["systemctl", "--user", *args], env=env, capture_output=True, text=True)
 
 
+def migrate_workspace(image, source):
+    """Called only after the old harness is stopped; no host bind is mounted."""
+    expected = workspace.digest(source)
+    producer = subprocess.Popen(['tar', '-C', str(source), '-cf', '-', '.'],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        code = Path(workspace.__file__).read_text()
+        args = ['run', '--rm', '--interactive', '--network', 'none', '--user', '0',
+                '--read-only', '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--cap-add', 'FOWNER',
+                '--security-opt', 'no-new-privileges', '--pids-limit', '64', '--memory', '512m',
+                '--mount', f'type=volume,source={VOLUME},target=/workspace',
+                '--entrypoint', 'python3', image, '-c', code, str(UID)]
+        result = docker(args, stdin=producer.stdout, capture_output=True, text=True, timeout=180)
+        producer.stdout.close()
+        if producer.wait(timeout=10) != 0:
+            raise RuntimeError('Workspace archive failed; original kept for rollback')
+        copied = json.loads(result.stdout)
+        if copied != expected or workspace.digest(source) != expected:
+            raise RuntimeError('Workspace changed during migration or copy digest differs')
+        print(json.dumps({'workspace_copy': 'verified', **copied}))
+    finally:
+        producer.stdout.close()
+        if producer.poll() is None:
+            producer.terminate()
+            producer.wait(timeout=10)
+
+
 def activate(image, source_env):
     image_id(image)
     script = Path(__file__).resolve()
     source_env = Path(source_env).resolve(strict=True)
+    source_workspace = None
+    if AGENT not in {'gemma', 'fizz'}:
+        source_workspace = workspace.validate(WORKSPACE_ROOT / AGENT)
     # Fixed pilot scope; never accepts a user-provided service, mount, or command.
     if any(c in str(p) for p in (script, source_env) for c in ' \t\n\r%"\\'):
         raise ValueError("Unsupported character in unit path")
@@ -218,7 +268,15 @@ def activate(image, source_env):
     if state != "active":
         raise ValueError(f"Expected the original {DISPLAY_NAME} service to be active before migration")
     docker(["image", "inspect", image], stdout=subprocess.DEVNULL)
+    actual_user = docker(["image", "inspect", image, "--format", "{{.Config.User}}"],
+                         capture_output=True, text=True).stdout.strip()
+    if actual_user != f'{UID}:{UID}':
+        raise ValueError('Image identity does not match the selected agent profile')
     docker(["volume", "create", "--label", LABEL, VOLUME], capture_output=True)
+    declared = {match.group(1) for line in source_env.read_text().splitlines()
+                if (match := re.match(r'^([A-Z][A-Z0-9_]*)=', line))}
+    # Missing target values must not inherit another identity's manager env.
+    unset = ' '.join(sorted(FORWARDED - declared))
     unit.write_text(f'''[Unit]
 Description=Isolated {DISPLAY_NAME} pilot (harness and every child tool)
 After=network-online.target
@@ -228,6 +286,7 @@ Wants=network-online.target
 Type=simple
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 EnvironmentFile={source_env}
+UnsetEnvironment={unset}
 ExecStart=/usr/bin/python3 "{script}" --agent {AGENT} run --image {image}
 ExecStop=/usr/bin/docker stop --time 25 {NAME}
 Restart=on-failure
@@ -246,6 +305,8 @@ WantedBy=default.target
         systemctl("disable", "--now", ORIGINAL_SERVICE)
         if systemctl("show", ORIGINAL_SERVICE, "--property=MainPID", "--value").stdout.strip() != "0":
             raise RuntimeError(f"Old {DISPLAY_NAME} still has a MainPID; refusing duplicate identity")
+        if source_workspace is not None:
+            migrate_workspace(image, source_workspace)
         systemctl("enable", "--now", NAME + ".service")
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -260,7 +321,7 @@ WantedBy=default.target
         else:
             raise RuntimeError("Pilot did not become a running container")
         systemctl("is-active", NAME + ".service")
-    except (subprocess.SubprocessError, RuntimeError):
+    except (subprocess.SubprocessError, RuntimeError, ValueError, OSError):
         systemctl("disable", "--now", NAME + ".service")
         remaining = docker(["ps", "--filter", "name=^/" + NAME + "$", "--format", "{{.ID}}"],
                            capture_output=True, text=True)
@@ -285,7 +346,7 @@ def rollback():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--agent", choices=("gemma", "fizz"), default="gemma")
+    parser.add_argument("--agent", choices=tuple(PROFILES), default="gemma")
     commands = parser.add_subparsers(dest="command", required=True)
     p = commands.add_parser("build")
     p.add_argument("--context", required=True)

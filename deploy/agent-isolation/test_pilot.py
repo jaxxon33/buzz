@@ -23,7 +23,7 @@ class Configuration(unittest.TestCase):
         original = pilot.AGENT
         profiles = []
         try:
-            for agent, expected_uid in (("gemma", 61021), ("fizz", 61022)):
+            for agent, (expected_uid, _) in pilot.PROFILES.items():
                 pilot.configure(agent)
                 args = pilot.runtime_args("sha256:" + "a" * 64)
                 self.assertEqual(args[args.index("--user") + 1], f"{expected_uid}:{expected_uid}")
@@ -40,7 +40,7 @@ class Configuration(unittest.TestCase):
                         pilot.runtime_args("sha256:" + "a" * 64, desktop=True)
                 profiles.append((pilot.NAME, pilot.VOLUME, pilot.UID))
             for column in range(3):
-                self.assertEqual(len({p[column] for p in profiles}), 2)
+                self.assertEqual(len({p[column] for p in profiles}), len(pilot.PROFILES))
             with self.assertRaises(ValueError):
                 pilot.configure("../../sol")
         finally:
@@ -107,6 +107,7 @@ class MigrationJourney(unittest.TestCase):
                     if args == ("daemon-reload",):
                         unit = home / ".config/systemd/user" / (pilot.NAME + ".service")
                         if unit.exists() and shutil.which("systemd-analyze"):
+                            self.assertIn('BUZZ_AUTH_TAG', unit.read_text().split('UnsetEnvironment=',1)[1].splitlines()[0])
                             parsed = subprocess.run(["systemd-analyze", "--user", "verify", str(unit)],
                                                     capture_output=True, text=True, timeout=20)
                             self.assertNotIn("path is not absolute", parsed.stderr)
@@ -122,9 +123,15 @@ class MigrationJourney(unittest.TestCase):
                         self.assertFalse(state["pilot"], "duplicate live identities")
                     return subprocess.CompletedProcess(args, 0, stdout="")
 
+                def image_command(args, **kwargs):
+                    value = f'{pilot.UID}:{pilot.UID}' if '{{.Config.User}}' in args else ''
+                    return subprocess.CompletedProcess([], 0, stdout=value)
+
                 with mock.patch.object(pilot.Path, "home", return_value=home), \
                      mock.patch.object(pilot, "systemctl", side_effect=service), \
-                     mock.patch.object(pilot, "docker", return_value=subprocess.CompletedProcess([], 0, stdout="")):
+                     mock.patch.object(pilot, "docker", side_effect=image_command), \
+                     mock.patch.object(pilot.workspace, "validate", return_value=home), \
+                     mock.patch.object(pilot, "migrate_workspace"):
                     with self.assertRaises((subprocess.CalledProcessError, RuntimeError)):
                         pilot.activate("sha256:" + "a" * 64, env_file)
                 self.assertIn(("enable", "--now", pilot.ORIGINAL_SERVICE), calls)

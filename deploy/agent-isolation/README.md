@@ -182,3 +182,23 @@ denial. Confirm the agent is idle, retain its workspace volume and previous
 service/image for rollback, and exercise a disposable screenshot/inspect/click
 task after restart. Finish by testing Hive's owner Stop and verifying further
 agent input and lease acquisition are refused. Mac control is outside this pilot.
+
+## Approved remaining buzz-agent batch
+
+The controller also recognises the fifteen explicitly approved profiles from
+bolt through venice in `PROFILES`, each with a distinct fixed UID and volume.
+m5, max and native adapters are excluded pending separate dependency review.
+Only Fizz can receive SSH/desktop credential mounts. OpenAI-compatible and
+OpenRouter provider settings are preserved independently, including sender
+allowlists; target-undeclared forwarded variables are explicitly unset in the
+unit so manager credentials cannot leak into a different identity.
+
+Check actual workflow and idle state before each move. Activation validates the
+selected image UID, stops the original and proves its PID is gone, then copies
+only `/home/paul/buzz/nests/<selected-agent>` through a network-disabled,
+temporary provisioning container. The source remains untouched. No host bind
+mount is used. External symlinks and special files require a migration plan;
+safe relative links are retained. An existing nonempty isolated volume is never
+overwritten. File/link/directory content digests must match before the worker
+starts. Failures restore the old service only after proving the replacement is
+stopped. Validate the agent's actual new tools, chat and work before proceeding.
