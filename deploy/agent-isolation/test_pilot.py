@@ -15,9 +15,27 @@ import uuid
 SPEC = importlib.util.spec_from_file_location("pilot", Path(__file__).with_name("pilot.py"))
 pilot = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pilot)
+pilot.configure(os.environ.get("PILOT_AGENT", "gemma"))
 
 
 class Configuration(unittest.TestCase):
+    def test_agent_profiles_have_distinct_authority_and_workspaces(self):
+        original = pilot.AGENT
+        profiles = []
+        try:
+            for agent, expected_uid in (("gemma", 61021), ("fizz", 61022)):
+                pilot.configure(agent)
+                args = pilot.runtime_args("sha256:" + "a" * 64)
+                self.assertEqual(args[args.index("--user") + 1], f"{expected_uid}:{expected_uid}")
+                self.assertIn(f"type=volume,source={pilot.VOLUME},target=/workspace", args)
+                profiles.append((pilot.NAME, pilot.VOLUME, pilot.UID))
+            for column in range(3):
+                self.assertEqual(len({p[column] for p in profiles}), 2)
+            with self.assertRaises(ValueError):
+                pilot.configure("../../sol")
+        finally:
+            pilot.configure(original)
+
     def test_refuses_mutable_images_and_never_forwards_host_control(self):
         for value in ("image:latest", "sha256:abc", "--privileged", ""):
             with self.subTest(value=value), self.assertRaises(ValueError):
@@ -82,7 +100,7 @@ class MigrationJourney(unittest.TestCase):
                             parsed = subprocess.run(["systemd-analyze", "--user", "verify", str(unit)],
                                                     capture_output=True, text=True, timeout=20)
                             self.assertNotIn("path is not absolute", parsed.stderr)
-                    if args[:2] == ("show", "buzz-acp@gemma.service"):
+                    if args[:2] == ("show", pilot.ORIGINAL_SERVICE):
                         value = "active" if "--property=ActiveState" in args else old_pid
                         return subprocess.CompletedProcess(args, 0, stdout=value + "\n")
                     if args == ("enable", "--now", pilot.NAME + ".service"):
@@ -90,7 +108,7 @@ class MigrationJourney(unittest.TestCase):
                         raise subprocess.CalledProcessError(1, ["systemctl"])
                     if args == ("disable", "--now", pilot.NAME + ".service"):
                         state["pilot"] = False
-                    if args == ("enable", "--now", "buzz-acp@gemma.service"):
+                    if args == ("enable", "--now", pilot.ORIGINAL_SERVICE):
                         self.assertFalse(state["pilot"], "duplicate live identities")
                     return subprocess.CompletedProcess(args, 0, stdout="")
 
@@ -99,7 +117,7 @@ class MigrationJourney(unittest.TestCase):
                      mock.patch.object(pilot, "docker", return_value=subprocess.CompletedProcess([], 0, stdout="")):
                     with self.assertRaises((subprocess.CalledProcessError, RuntimeError)):
                         pilot.activate("sha256:" + "a" * 64, env_file)
-                self.assertIn(("enable", "--now", "buzz-acp@gemma.service"), calls)
+                self.assertIn(("enable", "--now", pilot.ORIGINAL_SERVICE), calls)
                 self.assertFalse((home / ".config/systemd/user" / (pilot.NAME + ".service")).exists())
                 if old_pid != "0":
                     self.assertNotIn(("enable", "--now", pilot.NAME + ".service"), calls)
@@ -195,6 +213,7 @@ print(json.dumps({'uid':os.getuid(),'host_files':'blocked','host_processes':'hid
             try:
                 args = pilot.runtime_args(image, name, volume, entrypoint="python3", network="none")
                 args += ["--interactive", image, "-", marker.name]
+                code = code.replace("61021", str(pilot.UID))
                 result = subprocess.run(["docker", *args], input=code, text=True,
                                         capture_output=True, timeout=80)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

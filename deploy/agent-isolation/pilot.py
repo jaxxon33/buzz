@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Host-side controller for one isolated buzz-agent runtime (never a worker tool)."""
 import argparse
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -18,6 +19,25 @@ from relay_tunnel import Tunnel
 NAME = "buzz-isolated-gemma"
 VOLUME = NAME + "-workspace"
 LABEL = "buzz.isolation.pilot=gemma"
+AGENT = "gemma"
+DISPLAY_NAME = "Gemma"
+UID = 61021
+ORIGINAL_SERVICE = "buzz-acp@gemma.service"
+
+
+def configure(agent):
+    """Only these two explicitly provisioned identities can use this controller."""
+    global AGENT, DISPLAY_NAME, NAME, VOLUME, LABEL, UID, ORIGINAL_SERVICE
+    if agent not in {"gemma", "fizz"}:
+        raise ValueError("Unsupported isolation pilot")
+    AGENT = agent
+    DISPLAY_NAME = agent.title()
+    NAME = "buzz-isolated-" + agent
+    VOLUME = NAME + "-workspace"
+    LABEL = "buzz.isolation.pilot=" + agent
+    UID = {"gemma": 61021, "fizz": 61022}[agent]
+    ORIGINAL_SERVICE = "buzz-acp@" + agent + ".service"
+
 # No ambient host environment, proxy configuration, remote MCP or SSH is forwarded.
 FORWARDED = frozenset({
     "BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG", "BUZZ_RELAY_URL", "BUZZ_ACP_PUBKEY",
@@ -27,6 +47,9 @@ FORWARDED = frozenset({
     "BUZZ_ACP_MAX_TURNS_PER_SESSION", "BUZZ_ACP_SYSTEM_PROMPT",
     "BUZZ_AGENT_PROVIDER", "OPENAI_COMPAT_BASE_URL", "OPENAI_COMPAT_MODEL",
     "OPENAI_COMPAT_API_KEY", "OPENAI_COMPAT_API",
+    "BUZZ_ACP_CONTEXT_MESSAGE_LIMIT", "BUZZ_ACP_TEAM_INSTRUCTIONS",
+    "BUZZ_AGENT_THINKING_EFFORT", "BUZZ_AGENT_MAX_OUTPUT_TOKENS",
+    "BUZZ_AGENT_MAX_CONTEXT_TOKENS", "BUZZ_AGENT_REQUIRE_REPLY",
 })
 
 
@@ -44,11 +67,13 @@ def image_id(value):
     return value
 
 
-def runtime_args(image, name=NAME, volume=VOLUME, entrypoint=None, network="bridge"):
+def runtime_args(image, name=None, volume=None, entrypoint=None, network="bridge"):
     """The same confinement arguments are used for probes and the live harness."""
     image_id(image)
+    name = name or NAME
+    volume = volume or VOLUME
     args = ["run", "--rm", "--name", name, "--label", LABEL, "--init",
-            "--user", "61021:61021", "--cap-drop", "ALL",
+            "--user", f"{UID}:{UID}", "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges:true", "--read-only",
             "--pids-limit", "256", "--memory", "2g", "--cpus", "2",
             "--network", network,
@@ -80,7 +105,7 @@ def build(context, binary_dir, prompt):
     for name in ("contained.py", "relay_tunnel.py"):
         shutil.copyfile(Path(__file__).with_name(name), context / name)
     (context / "manifest.json").write_text(json.dumps(hashes, indent=2) + "\n")
-    docker(["build", "--tag", NAME + ":pilot", str(context)], timeout=600)
+    docker(["build", "--build-arg", f"WORKER_UID={UID}", "--tag", NAME + ":pilot", str(context)], timeout=600)
     result = docker(["image", "inspect", "--format", "{{.Id}}", NAME + ":pilot"],
                     capture_output=True, text=True)
     print(result.stdout.strip())
@@ -108,13 +133,20 @@ def start(image):
     # The host's Tailscale listener rejects connections arriving on docker0.
     # This fixed-destination TCP hop is bound only to docker0, never a public IP.
     # A second hop inside the worker retains the original relay URL and TLS name.
-    with Tunnel((bridge, 0), (address, 443)) as tunnel:
+    with ExitStack() as cleanup:
+        tunnel = cleanup.enter_context(Tunnel((bridge, 0), (address, 443)))
         port = tunnel.start()
+        cleanup.callback(tunnel.shutdown)
         args += ["--env", "BUZZ_PILOT_RELAY_TARGET=" + json.dumps([bridge, port])]
-        try:
-            return subprocess.call(["docker", *args, image])
-        finally:
-            tunnel.shutdown()
+        provider = urlsplit(os.environ["OPENAI_COMPAT_BASE_URL"])
+        if AGENT == "fizz":
+            if (provider.scheme, provider.hostname, provider.port) != ("http", "127.0.0.1", 8100):
+                raise ValueError("Fizz pilot requires its existing local model service")
+            model_tunnel = cleanup.enter_context(Tunnel((bridge, 0), ("127.0.0.1", 8100)))
+            model_port = model_tunnel.start()
+            cleanup.callback(model_tunnel.shutdown)
+            args += ["--env", "BUZZ_PILOT_MODEL_TARGET=" + json.dumps([bridge, model_port])]
+        return subprocess.call(["docker", *args, image])
 
 
 def systemctl(*args):
@@ -134,17 +166,17 @@ def activate(image, source_env):
     unit_dir = Path.home() / ".config/systemd/user"
     unit = unit_dir / (NAME + ".service")
     if unit.exists():
-        if unit.is_symlink() or "Description=Isolated Gemma pilot" not in unit.read_text():
+        if unit.is_symlink() or f"Description=Isolated {DISPLAY_NAME} pilot" not in unit.read_text():
             raise ValueError("Refusing to overwrite an unknown pilot unit")
         if systemctl("show", NAME + ".service", "--property=ActiveState", "--value").stdout.strip() != "inactive":
             raise ValueError("Pilot unit already exists and is not stopped")
-    state = systemctl("show", "buzz-acp@gemma.service", "--property=ActiveState", "--value").stdout.strip()
+    state = systemctl("show", ORIGINAL_SERVICE, "--property=ActiveState", "--value").stdout.strip()
     if state != "active":
-        raise ValueError("Expected the original Gemma service to be active before migration")
+        raise ValueError(f"Expected the original {DISPLAY_NAME} service to be active before migration")
     docker(["image", "inspect", image], stdout=subprocess.DEVNULL)
     docker(["volume", "create", "--label", LABEL, VOLUME], capture_output=True)
     unit.write_text(f'''[Unit]
-Description=Isolated Gemma pilot (harness and every child tool)
+Description=Isolated {DISPLAY_NAME} pilot (harness and every child tool)
 After=network-online.target
 Wants=network-online.target
 
@@ -152,7 +184,7 @@ Wants=network-online.target
 Type=simple
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 EnvironmentFile={source_env}
-ExecStart=/usr/bin/python3 "{script}" run --image {image}
+ExecStart=/usr/bin/python3 "{script}" --agent {AGENT} run --image {image}
 ExecStop=/usr/bin/docker stop --time 25 {NAME}
 Restart=on-failure
 RestartSec=15
@@ -167,9 +199,9 @@ WantedBy=default.target
     systemctl("daemon-reload")
     # Stop the old identity before the replacement ever connects to the relay.
     try:
-        systemctl("disable", "--now", "buzz-acp@gemma.service")
-        if systemctl("show", "buzz-acp@gemma.service", "--property=MainPID", "--value").stdout.strip() != "0":
-            raise RuntimeError("Old Gemma still has a MainPID; refusing duplicate identity")
+        systemctl("disable", "--now", ORIGINAL_SERVICE)
+        if systemctl("show", ORIGINAL_SERVICE, "--property=MainPID", "--value").stdout.strip() != "0":
+            raise RuntimeError(f"Old {DISPLAY_NAME} still has a MainPID; refusing duplicate identity")
         systemctl("enable", "--now", NAME + ".service")
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -190,7 +222,7 @@ WantedBy=default.target
                            capture_output=True, text=True)
         if remaining.stdout.strip():
             raise RuntimeError("Pilot failed but is still running; original kept stopped")
-        systemctl("enable", "--now", "buzz-acp@gemma.service")
+        systemctl("enable", "--now", ORIGINAL_SERVICE)
         unit.unlink()
         systemctl("daemon-reload")
         raise
@@ -203,12 +235,13 @@ def rollback():
                     capture_output=True, text=True)
     if result.stdout.strip():
         raise RuntimeError("Pilot container is still running; refusing duplicate identity")
-    systemctl("enable", "--now", "buzz-acp@gemma.service")
-    print("Original Gemma restored; pilot workspace retained")
+    systemctl("enable", "--now", ORIGINAL_SERVICE)
+    print(f"Original {DISPLAY_NAME} restored; pilot workspace retained")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--agent", choices=("gemma", "fizz"), default="gemma")
     commands = parser.add_subparsers(dest="command", required=True)
     p = commands.add_parser("build")
     p.add_argument("--context", required=True)
@@ -221,6 +254,7 @@ def main():
             p.add_argument("--env-file", required=True)
     commands.add_parser("rollback")
     args = parser.parse_args()
+    configure(args.agent)
     if args.command == "build":
         build(args.context, args.binary_dir, args.prompt)
     elif args.command == "run":

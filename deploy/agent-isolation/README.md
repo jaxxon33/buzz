@@ -1,4 +1,4 @@
-# One-agent isolation pilot
+# Agent isolation pilots
 
 This operator deployment runs an existing `buzz-acp` + `buzz-agent` +
 `buzz-dev-mcp` installation inside one non-root container. It changes no Buzz
@@ -8,7 +8,8 @@ inside the same boundary.
 
 ## Scope
 
-The fixed pilot is Gemma, with UID/GID 61021, a private named workspace volume,
+The supported pilots are Gemma (UID/GID 61021) and Fizz (UID/GID 61022). Each has
+its own service, container, private named workspace volume,
 a read-only image and private PID/mount/network namespaces. No host home,
 Docker socket, SSH agent, host D-Bus, privileged capabilities or host repository
 is mounted. Repository work starts with one local repo in the private volume;
@@ -87,3 +88,26 @@ Rollback stops and disables the pilot before restoring the original service,
 and retains its named workspace. Do not run both versions of the same identity.
 Audit shared credentials and old copies now; rotate affected credentials only
 after removing the old shared access. Existing backups also need that treatment.
+
+
+## Fizz
+
+Use `--agent fizz` before the `build`, `activate`, `run` or `rollback` command.
+This changes only the explicit Fizz service/container/volume names and worker UID;
+Gemma remains the default for existing service files. Build a separate Fizz image
+using the same runtime binaries and prompt. Run its tests with
+`PILOT_AGENT=fizz PILOT_IMAGE=sha256:... python3 -m unittest discover -s deploy/agent-isolation -v`.
+
+Fizz's existing HTTP model proxy is at 127.0.0.1:8100/v1 on the host. The host
+controller forwards only that destination through another bounded docker0-only
+TCP hop, and a loopback listener in the worker retains the existing provider URL.
+This local HTTP traffic crosses only the host's Docker bridge. No arbitrary
+forwarding endpoint, host networking, SSH key or host MCP server is exposed.
+
+The pilot uses the isolated buzz-dev-mcp shell/repo tools. Fizz's existing desktop
+MCP merger is deliberately excluded because it can control machines outside the
+boundary. The old service, custom MCP configuration and original nest are retained
+for rollback; the pilot starts with a separate workspace and does not migrate old
+worktrees, secret files, caches or symlink targets. It can create local test repos.
+The same provider/model, reply guard, context/output limits and team instructions
+are forwarded from Fizz's existing environment; no new account or billing is set up.
