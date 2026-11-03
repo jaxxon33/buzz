@@ -68,7 +68,7 @@ def image_id(value):
     return value
 
 
-def runtime_args(image, name=None, volume=None, entrypoint=None, network="bridge", ssh=False):
+def runtime_args(image, name=None, volume=None, entrypoint=None, network="bridge", ssh=False, desktop=False):
     """The same confinement arguments are used for probes and the live harness."""
     image_id(image)
     name = name or NAME
@@ -87,6 +87,10 @@ def runtime_args(image, name=None, volume=None, entrypoint=None, network="bridge
         if AGENT != "fizz":
             raise ValueError("Only the Fizz pilot has an approved SSH credential mount")
         args += ["--mount", "type=volume,source=buzz-isolated-fizz-ssh,target=/run/fizz-ssh,readonly"]
+    if desktop:
+        if AGENT != "fizz" or not ssh:
+            raise ValueError("Desktop is provisioned only for the Fizz SSH pilot")
+        args += ["--mount", "type=volume,source=buzz-isolated-fizz-desktop,target=/run/fizz-desktop,readonly"]
     if entrypoint:
         args += ["--entrypoint", entrypoint]
     return args
@@ -154,7 +158,10 @@ def start(image):
                 "OPENAI_COMPAT_BASE_URL", "OPENAI_COMPAT_MODEL"}
     if not required.issubset(os.environ) or os.environ.get("BUZZ_AGENT_PROVIDER") != "openai":
         raise ValueError("Pilot requires its own complete OpenAI-compatible environment")
-    args = runtime_args(image, ssh=(AGENT == "fizz"))
+    desktop_profile = docker(["image", "inspect", image, "--format",
+                              '{{index .Config.Labels "buzz.isolation.desktop"}}'],
+                             capture_output=True, text=True).stdout.strip()
+    args = runtime_args(image, ssh=(AGENT == "fizz"), desktop=(desktop_profile == "fizz"))
     # Docker's default resolver cannot resolve the host's private/Tailscale DNS.
     # Resolve only the configured relay on the trusted host, retaining its TLS name.
     host = urlsplit(os.environ["BUZZ_RELAY_URL"]).hostname

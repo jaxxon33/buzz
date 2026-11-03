@@ -141,3 +141,44 @@ not extraction. Remote account separation and the key broker remain later work.
 Keep old image IDs for rollback. To rotate Fizz's key, reprovision only its
 credential volume while the pilot is stopped and verify the public fingerprint
 before restarting. Do not change shared SSH credentials or weaken host-key checks.
+
+## Fizz desktop pilot
+
+Extend the verified Fizz SSH image with `build_desktop.py`. Supply an immutable
+local `--base` image ID, a digest-pinned `--node node@sha256:...` image,
+fresh compiled broker `--compiled` output and a `--pin-file` containing one
+trusted `hive-desk ssh-ed25519 ...` record. `--context` must not exist. The
+builder copies only the desktop client's JavaScript dependency closure,
+module metadata, fixed transport configuration and merge helper. Private keys,
+broker state, host MCP configuration and owner/watch credentials never enter
+the build context. The local base tag is derived from the supplied image ID
+and verified after the build; its immutable identity is kept in the manifest.
+
+The desktop image sets its own MCP command to `fizz-mcp`, combining the existing
+contained buzz-dev-mcp with desktop-mcp. Node and both command wrappers are in
+the read-only image. A dead child fails the merge so pending initialization or
+tool discovery cannot silently hang. Message length and pending counts are
+bounded; merge termination stops both children.
+
+Provision only Fizz's existing desktop key into `buzz-isolated-fizz-desktop`,
+owner 61022, file mode 0400 and directory mode 0500. Set restrictive modes
+before transferring ownership when provisioning with dropped capabilities.
+The immutable image label `buzz.isolation.desktop=fizz` makes the controller
+mount that volume read-only at `/run/fizz-desktop`, in addition to the unchanged
+workspace and separate ag key. Other image profiles receive no desktop key.
+
+Desktop SSH uses a separate pinned host key, fixed `hive-desktop@10.0.64.160:22`
+and the existing VM-side forced command `cu-exec --agent fizz`. The daemon
+remains the authority for identity, lease, tools and Stop. Do not mount an
+owner/watch key or replace the remote forced command with a general shell.
+The existing bridge and model/relay/ag routes are retained. This does not add
+an outbound firewall to the container: its previously documented open egress
+remains; the VM's own desktop egress proxy/firewall remains authoritative.
+
+Before cutover, run the full package with `PILOT_AGENT=fizz`, `PILOT_IMAGE` and
+`PILOT_DESKTOP_IMAGE` set to the new immutable ID. Verify real merged shell and
+desktop discovery, both SSH paths, public key fingerprint and owner-method
+denial. Confirm the agent is idle, retain its workspace volume and previous
+service/image for rollback, and exercise a disposable screenshot/inspect/click
+task after restart. Finish by testing Hive's owner Stop and verifying further
+agent input and lease acquisition are refused. Mac control is outside this pilot.

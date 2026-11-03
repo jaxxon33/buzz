@@ -1,0 +1,20 @@
+# A separately built layer for Fizz only. The host builder verifies the exact
+# local base image ID and supplies a digest-pinned Node image.
+ARG BASE_IMAGE
+ARG NODE_IMAGE
+FROM ${NODE_IMAGE} AS node
+FROM ${BASE_IMAGE}
+USER 0
+COPY --from=node --chmod=0555 /usr/local/bin/node /usr/local/bin/node
+COPY --chmod=0444 desktop/ /opt/buzz/desktop/
+COPY --chmod=0444 desktop-ssh.conf /etc/ssh/ssh_config.d/80-buzz-desktop.conf
+COPY --chmod=0444 desktop-known-hosts /opt/buzz/desktop-known-hosts
+COPY --chmod=0555 mcp_merge.py /opt/buzz/mcp_merge.py
+COPY --chmod=0555 fizz-mcp /opt/buzz/bin/fizz-mcp
+COPY --chmod=0555 desktop-mcp /opt/buzz/bin/desktop-mcp
+COPY --chmod=0444 fizz-merge.json /opt/buzz/fizz-merge.json
+RUN find /opt/buzz/desktop -type d -exec chmod 0555 {} + \
+    && node --version
+LABEL buzz.isolation.desktop="fizz"
+ENV BUZZ_ACP_MCP_COMMAND=/opt/buzz/bin/fizz-mcp
+USER 61022:61022

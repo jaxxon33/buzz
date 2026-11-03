@@ -31,9 +31,13 @@ class Configuration(unittest.TestCase):
                 if agent == "fizz":
                     ssh_args = pilot.runtime_args("sha256:" + "a" * 64, ssh=True)
                     self.assertIn("type=volume,source=buzz-isolated-fizz-ssh,target=/run/fizz-ssh,readonly", ssh_args)
+                    desktop_args = pilot.runtime_args("sha256:" + "a" * 64, ssh=True, desktop=True)
+                    self.assertIn("type=volume,source=buzz-isolated-fizz-desktop,target=/run/fizz-desktop,readonly", desktop_args)
                 else:
                     with self.assertRaises(ValueError):
                         pilot.runtime_args("sha256:" + "a" * 64, ssh=True)
+                    with self.assertRaises(ValueError):
+                        pilot.runtime_args("sha256:" + "a" * 64, desktop=True)
                 profiles.append((pilot.NAME, pilot.VOLUME, pilot.UID))
             for column in range(3):
                 self.assertEqual(len({p[column] for p in profiles}), 2)
