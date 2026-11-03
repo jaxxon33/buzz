@@ -61,7 +61,9 @@ for line in sys.stdin:
             finally:
                 if p.poll() is None:
                     p.terminate()
-                p.communicate(timeout=8)
+                _, stderr = p.communicate(timeout=8)
+                self.assertNotIn('Exception ignored', stderr)
+                self.assertNotIn('Traceback', stderr)
 
     def test_routes_dev_and_desktop_tools(self):
         self.run_merge()
@@ -101,3 +103,5 @@ finally:
                                 capture_output=True, text=True, timeout=45)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('MERGED_REAL_TOOLS_PASS', result.stdout)
+        self.assertNotIn('Exception ignored', result.stderr)
+        self.assertNotIn('Traceback', result.stderr)

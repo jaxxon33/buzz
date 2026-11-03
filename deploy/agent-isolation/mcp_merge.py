@@ -13,11 +13,13 @@ import atexit, json, os, signal, subprocess, sys, threading
 
 MAX_LINE = 32 * 1024 * 1024  # desktop image responses are bounded below this
 MAX_PENDING = 64
+closing = threading.Event()
 
 
 def fatal():
     # Wake the main thread even when it is blocked waiting for client input.
-    os.kill(os.getpid(), signal.SIGTERM)
+    if not closing.is_set():
+        os.kill(os.getpid(), signal.SIGTERM)
 
 
 def lines(stream):
@@ -62,6 +64,10 @@ children = []
 
 
 def cleanup():
+    # Child EOF during shutdown must not interrupt the bounded reap/kill path.
+    closing.set()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     for child in children:
         try:
             os.killpg(child.p.pid, signal.SIGTERM)
