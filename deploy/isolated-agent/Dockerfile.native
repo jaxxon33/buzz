@@ -1,0 +1,148 @@
+# syntax=docker/dockerfile:1.7
+#
+# Whole-agent container for Buzz agents that use a *native* coding runtime:
+#
+#   buzz-acp (harness)  ──stdio──►  claude-agent-acp  (Claude Code ACP adapter)
+#                                or codex-acp         (OpenAI Codex ACP adapter)
+#                                        │
+#                                        └─ the runtime's own built-in shell/tools
+#
+# Native runtimes execute tools through their own shell, so the harness, the
+# adapter, and everything that shell can reach must live inside this one
+# container. Nothing from the host home is baked in or expected at runtime.
+#
+# Build from the repository root (the build context must contain crates/):
+#
+#   docker build -f deploy/isolated-agent/Dockerfile.native \
+#     -t buzz-native-agent:dev .
+#
+# See deploy/isolated-agent/README.md for mounts, systemd launch, and the
+# verification log (including how this was built behind a TLS-intercepting
+# proxy with BASE_REGISTRY + the optional `extra_ca` build secret).
+
+# Registry prefix for base images. Override (e.g. mirror.gcr.io/library) when
+# Docker Hub is rate-limited or blocked.
+ARG BASE_REGISTRY=docker.io/library
+ARG RUST_VERSION=1.95
+ARG NODE_MAJOR=22
+ARG DEBIAN_VERSION=bookworm
+# "-slim" (default) or "" for the full node image; see the runtime stage.
+ARG RUNTIME_VARIANT=-slim
+
+# ─── Stage 1: build buzz-acp + buzz CLI ─────────────────────────────────────
+FROM ${BASE_REGISTRY}/rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
+
+# Optional build-time-only CA (TLS-intercepting proxy). Supplied as a BuildKit
+# secret so it never lands in an image layer:
+#   docker build --secret id=extra_ca,src=/path/to/proxy-ca.pem ...
+RUN --mount=type=secret,id=extra_ca,required=false \
+    if [ -s /run/secrets/extra_ca ]; then \
+        cp /run/secrets/extra_ca /usr/local/share/ca-certificates/extra-build-ca.crt \
+        && update-ca-certificates; \
+    fi
+ENV CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true
+
+WORKDIR /build
+COPY . .
+# `buzz` (buzz-cli) is how the agent replies to the relay from its shell, so it
+# ships alongside the harness.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --locked --release -p buzz-acp -p buzz-cli \
+    && install -D -m 0755 target/release/buzz-acp /out/buzz-acp \
+    && install -D -m 0755 target/release/buzz /out/buzz \
+    && strip /out/buzz-acp /out/buzz \
+    # Hand the (possibly proxy-augmented) CA bundle to the runtime stage for
+    # its first apt-get only; it is deleted there and never shipped.
+    && cp /etc/ssl/certs/ca-certificates.crt /out/build-ca-bundle.crt
+
+# ─── Stage 2: runtime ───────────────────────────────────────────────────────
+# RUNTIME_VARIANT=slim (default) installs the shell toolbox with apt on top of
+# node:<major>-bookworm-slim. RUNTIME_VARIANT="" with INSTALL_APT_PACKAGES=0
+# uses the full node:<major>-bookworm image (buildpack-deps: already ships git,
+# openssh-client, curl, ca-certificates, procps) for networks where the Debian
+# mirrors are unreachable. Both paths must yield git + ssh or the build fails.
+FROM ${BASE_REGISTRY}/node:${NODE_MAJOR}-${DEBIAN_VERSION}${RUNTIME_VARIANT}
+
+# Pinned adapter versions — current npm package names (checked 2026-11-03):
+#   @agentclientprotocol/claude-agent-acp — the Claude Code ACP adapter
+#     (formerly @zed-industries/claude-code-acp, then
+#     @zed-industries/claude-agent-acp; both deprecated). Binary: claude-agent-acp.
+#   @agentclientprotocol/codex-acp — formerly @zed-industries/codex-acp
+#     (deprecated). Binary: codex-acp. Pulls @openai/codex (native binary).
+#
+# NOT the latest releases (0.100.0 / 2.5.0 on that date). From
+# claude-agent-acp 0.95.0 and codex-acp 2.3.0 the adapters implement upstream
+# ACP v2 (@agentclientprotocol/sdk 2.x), whose `initialize` requires an `info`
+# object. buzz-acp in this tree sends its pre-RFD "v2" initialize
+# (protocolVersion 2 + clientInfo), which those versions reject with -32602
+# Invalid params, so the harness cannot start them. 0.94.0 / 2.2.2 are the
+# newest versions that accept it (they negotiate down to protocolVersion 1).
+# probe.sh checks exactly this; see README "Verification".
+ARG CLAUDE_AGENT_ACP_VERSION=0.94.0
+ARG CODEX_ACP_VERSION=2.2.2
+ARG AGENT_UID=61000
+ARG AGENT_GID=61000
+ARG INSTALL_APT_PACKAGES=1
+
+# The slim image has no CA bundle, so the first apt-get uses the builder's
+# bundle (which includes the optional build-only CA) via Acquire::https::CAInfo.
+# It is deleted afterwards; the image's trust store comes from the distro
+# ca-certificates package only. apt is switched to HTTPS (plain HTTP egress is
+# commonly blocked). PID 1 is provided by `docker run --init` (tini).
+COPY --from=builder /out/build-ca-bundle.crt /tmp/build-ca-bundle.crt
+RUN if [ "${INSTALL_APT_PACKAGES}" = "1" ]; then \
+        sed -i 's|http://deb.debian.org|https://deb.debian.org|g' \
+            /etc/apt/sources.list.d/debian.sources \
+        && apt-get -o Acquire::https::CAInfo=/tmp/build-ca-bundle.crt update \
+        && apt-get -o Acquire::https::CAInfo=/tmp/build-ca-bundle.crt install -y \
+            --no-install-recommends \
+            bash ca-certificates curl git jq less openssh-client procps ripgrep \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi \
+    && rm -f /tmp/build-ca-bundle.crt \
+    && command -v git && command -v ssh && test -s /etc/ssl/certs/ca-certificates.crt
+
+# Global npm installs land in /usr/local (root-owned, not writable by the agent).
+RUN --mount=type=secret,id=extra_ca,required=false \
+    if [ -s /run/secrets/extra_ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/extra_ca; fi \
+    && npm install -g --no-fund --no-audit \
+        "@agentclientprotocol/claude-agent-acp@${CLAUDE_AGENT_ACP_VERSION}" \
+        "@agentclientprotocol/codex-acp@${CODEX_ACP_VERSION}" \
+    # Expose the codex CLI bundled with codex-acp so `codex login` can seed
+    # ~/.codex without installing anything on the host.
+    && codex_bin="$(find /usr/local/lib/node_modules/@agentclientprotocol/codex-acp/node_modules/@openai/codex/bin \
+        -maxdepth 1 -name 'codex.js' | head -n1)" \
+    && if [ -n "$codex_bin" ]; then ln -s "$codex_bin" /usr/local/bin/codex; fi \
+    && npm cache clean --force
+
+COPY --from=builder /out/buzz-acp /out/buzz /usr/local/bin/
+COPY --chmod=0755 deploy/isolated-agent/entrypoint.sh /usr/local/bin/buzz-native-entrypoint
+COPY --chmod=0755 deploy/isolated-agent/probe.sh /usr/local/bin/buzz-isolation-probe
+
+# Fixed non-root identity. The base image's `node` user (uid 1000) is left
+# alone; the agent never runs as it.
+RUN groupadd --gid "${AGENT_GID}" agent \
+    && useradd --uid "${AGENT_UID}" --gid "${AGENT_GID}" --home-dir /home/agent \
+        --create-home --shell /bin/bash agent \
+    && install -d -o agent -g agent -m 0700 \
+        /home/agent/.claude /home/agent/.codex /home/agent/.ssh \
+    && install -d -o agent -g agent -m 0755 /workspace
+
+# Runtime state lives in two directories, each meant to be a per-agent volume.
+# CLAUDE_CONFIG_DIR also moves Claude Code's ~/.claude.json inside the volume.
+ENV HOME=/home/agent \
+    CLAUDE_CONFIG_DIR=/home/agent/.claude \
+    CODEX_HOME=/home/agent/.codex \
+    BUZZ_ACP_AGENT_COMMAND=claude-agent-acp \
+    NODE_ENV=production
+
+USER ${AGENT_UID}:${AGENT_GID}
+WORKDIR /workspace
+VOLUME ["/workspace", "/home/agent/.claude", "/home/agent/.codex"]
+
+# Run with `docker run --init` so tini reaps the runtimes' shell children and
+# forwards SIGTERM to buzz-acp.
+ENTRYPOINT ["/usr/local/bin/buzz-native-entrypoint"]
