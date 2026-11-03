@@ -187,7 +187,9 @@ agent input and lease acquisition are refused. Mac control is outside this pilot
 
 The controller also recognises the fifteen explicitly approved profiles from
 bolt through venice in `PROFILES`, each with a distinct fixed UID and volume.
-m5, max and native adapters are excluded pending separate dependency review.
+m5 and native adapters are excluded pending separate dependency review.
+Max is approved separately after checking its existing model-server path from
+inside a container; it has its own fixed UID and workspace, without SSH keys.
 Only Fizz can receive SSH/desktop credential mounts. OpenAI-compatible and
 OpenRouter provider settings are preserved independently, including sender
 allowlists; target-undeclared forwarded variables are explicitly unset in the

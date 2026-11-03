@@ -35,6 +35,7 @@ PROFILES = {
     "nora": (61033, "Nora"), "north": (61034, "North"),
     "omni": (61035, "Omni"), "spark": (61036, "Spark"),
     "venice": (61037, "Venice"),
+    "max": (61038, "Max"),
 }
 WORKSPACE_ROOT = Path('/home/paul/buzz/nests')
 
