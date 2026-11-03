@@ -3,6 +3,7 @@
 import argparse
 from contextlib import ExitStack
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -67,7 +68,7 @@ def image_id(value):
     return value
 
 
-def runtime_args(image, name=None, volume=None, entrypoint=None, network="bridge"):
+def runtime_args(image, name=None, volume=None, entrypoint=None, network="bridge", ssh=False):
     """The same confinement arguments are used for probes and the live harness."""
     image_id(image)
     name = name or NAME
@@ -82,16 +83,52 @@ def runtime_args(image, name=None, volume=None, entrypoint=None, network="bridge
             "--tmpfs", "/run:rw,noexec,nosuid,nodev,size=16m,mode=755",
             "--mount", f"type=volume,source={volume},target=/workspace",
             "--workdir", "/workspace", "--log-driver", "none"]
+    if ssh:
+        if AGENT != "fizz":
+            raise ValueError("Only the Fizz pilot has an approved SSH credential mount")
+        args += ["--mount", "type=volume,source=buzz-isolated-fizz-ssh,target=/run/fizz-ssh,readonly"]
     if entrypoint:
         args += ["--entrypoint", entrypoint]
     return args
 
 
-def build(context, binary_dir, prompt):
+def build(context, binary_dir, prompt, ag_host=None, known_hosts=None):
     """Build context intentionally contains no environment files or home mounts."""
+    if AGENT == "fizz" and (not ag_host or not known_hosts):
+        raise ValueError("Fizz build requires a pinned ag host and public known-hosts file")
+    if ag_host:
+        ipaddress.ip_address(ag_host)
     context = Path(context)
     context.mkdir(parents=True, exist_ok=False)
     (context / "bin").mkdir()
+    (context / "ssh").mkdir()
+    config = ""
+    pins = ""
+    if AGENT == "fizz":
+        pins = Path(known_hosts).read_text()
+        records = [line.split() for line in pins.splitlines() if line.strip()]
+        if len(records) != 1 or len(records[0]) != 3 or records[0][:2] != ["ag", "ssh-ed25519"]:
+            raise ValueError("Expected exactly one public ag Ed25519 host-key record")
+        config = f"""Host *
+    IdentityAgent none
+    IdentitiesOnly yes
+    BatchMode yes
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    ForwardAgent no
+    ClearAllForwardings yes
+    StrictHostKeyChecking yes
+    UserKnownHostsFile /opt/buzz/ssh/known_hosts
+    GlobalKnownHostsFile /dev/null
+    ControlMaster no
+Host ag
+    HostName {ag_host}
+    User paul
+    HostKeyAlias ag
+    IdentityFile /run/fizz-ssh/id_ed25519
+"""
+    (context / "ssh/config").write_text(config)
+    (context / "ssh/known_hosts").write_text(pins)
     hashes = {}
     for name in ("buzz-acp", "buzz-agent", "buzz-dev-mcp", "buzz"):
         source = Path(binary_dir) / name
@@ -117,7 +154,7 @@ def start(image):
                 "OPENAI_COMPAT_BASE_URL", "OPENAI_COMPAT_MODEL"}
     if not required.issubset(os.environ) or os.environ.get("BUZZ_AGENT_PROVIDER") != "openai":
         raise ValueError("Pilot requires its own complete OpenAI-compatible environment")
-    args = runtime_args(image)
+    args = runtime_args(image, ssh=(AGENT == "fizz"))
     # Docker's default resolver cannot resolve the host's private/Tailscale DNS.
     # Resolve only the configured relay on the trusted host, retaining its TLS name.
     host = urlsplit(os.environ["BUZZ_RELAY_URL"]).hostname
@@ -247,6 +284,8 @@ def main():
     p.add_argument("--context", required=True)
     p.add_argument("--binary-dir", required=True)
     p.add_argument("--prompt", required=True)
+    p.add_argument("--ag-host")
+    p.add_argument("--known-hosts")
     for command in ("run", "activate"):
         p = commands.add_parser(command)
         p.add_argument("--image", required=True, type=image_id)
@@ -256,7 +295,7 @@ def main():
     args = parser.parse_args()
     configure(args.agent)
     if args.command == "build":
-        build(args.context, args.binary_dir, args.prompt)
+        build(args.context, args.binary_dir, args.prompt, args.ag_host, args.known_hosts)
     elif args.command == "run":
         raise SystemExit(start(args.image))
     elif args.command == "activate":

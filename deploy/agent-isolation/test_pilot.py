@@ -28,6 +28,12 @@ class Configuration(unittest.TestCase):
                 args = pilot.runtime_args("sha256:" + "a" * 64)
                 self.assertEqual(args[args.index("--user") + 1], f"{expected_uid}:{expected_uid}")
                 self.assertIn(f"type=volume,source={pilot.VOLUME},target=/workspace", args)
+                if agent == "fizz":
+                    ssh_args = pilot.runtime_args("sha256:" + "a" * 64, ssh=True)
+                    self.assertIn("type=volume,source=buzz-isolated-fizz-ssh,target=/run/fizz-ssh,readonly", ssh_args)
+                else:
+                    with self.assertRaises(ValueError):
+                        pilot.runtime_args("sha256:" + "a" * 64, ssh=True)
                 profiles.append((pilot.NAME, pilot.VOLUME, pilot.UID))
             for column in range(3):
                 self.assertEqual(len({p[column] for p in profiles}), 2)
@@ -214,6 +220,19 @@ print(json.dumps({'uid':os.getuid(),'host_files':'blocked','host_processes':'hid
                 args = pilot.runtime_args(image, name, volume, entrypoint="python3", network="none")
                 args += ["--interactive", image, "-", marker.name]
                 code = code.replace("61021", str(pilot.UID))
+                if pilot.AGENT == "fizz":
+                    code = code.replace("canary = sys.argv[1]", """canary = sys.argv[1]
+# The worker must be able to traverse the public pin directory. COPY can
+# preserve a restrictive build-context directory mode even with --chmod on
+# the file; that silently makes strict host-key verification fail.
+pin = pathlib.Path('/opt/buzz/ssh/known_hosts')
+assert pin.read_text().startswith('ag ssh-ed25519 ')
+ssh_config = subprocess.run(['ssh', '-G', 'ag'], check=True,
+                            capture_output=True, text=True).stdout
+assert 'identityfile /run/fizz-ssh/id_ed25519' in ssh_config
+assert 'stricthostkeychecking true' in ssh_config
+assert 'identityagent none' in ssh_config
+""")
                 result = subprocess.run(["docker", *args], input=code, text=True,
                                         capture_output=True, timeout=80)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

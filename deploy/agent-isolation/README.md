@@ -12,7 +12,8 @@ The supported pilots are Gemma (UID/GID 61021) and Fizz (UID/GID 61022). Each ha
 its own service, container, private named workspace volume,
 a read-only image and private PID/mount/network namespaces. No host home,
 Docker socket, SSH agent, host D-Bus, privileged capabilities or host repository
-is mounted. Repository work starts with one local repo in the private volume;
+is mounted. Fizz alone now has an explicitly provisioned read-only credential
+volume containing only its own SSH key. Repository work starts with one local repo in the private volume;
 no shared GitHub or machine-admin credential is supplied. The image is selected
 by its immutable ID. The host systemd service supervises the Docker client;
 there is no worker-side Docker access. Docker's default seccomp profile remains
@@ -102,7 +103,7 @@ Fizz's existing HTTP model proxy is at 127.0.0.1:8100/v1 on the host. The host
 controller forwards only that destination through another bounded docker0-only
 TCP hop, and a loopback listener in the worker retains the existing provider URL.
 This local HTTP traffic crosses only the host's Docker bridge. No arbitrary
-forwarding endpoint, host networking, SSH key or host MCP server is exposed.
+forwarding endpoint, host networking or host MCP server is exposed by these tunnels.
 
 The pilot uses the isolated buzz-dev-mcp shell/repo tools. Fizz's existing desktop
 MCP merger is deliberately excluded because it can control machines outside the
@@ -111,3 +112,32 @@ for rollback; the pilot starts with a separate workspace and does not migrate ol
 worktrees, secret files, caches or symlink targets. It can create local test repos.
 The same provider/model, reply guard, context/output limits and team instructions
 are forwarded from Fizz's existing environment; no new account or billing is set up.
+
+
+## Fizz SSH / GitHub workflow (phase 1)
+
+Fizz's image includes openssh-client and an immutable SSH configuration for ag.
+Build with `--ag-host <ag IP> --known-hosts <public pin file>`; the pin file must
+contain exactly one `ag ssh-ed25519 ...` record derived from existing trusted
+known_hosts, never a private key. The image/build context contains no private key.
+
+The separate `buzz-isolated-fizz-ssh` credential volume contains only Fizz's
+provisioned key, owned by UID/GID 61022, mode 0400 inside a mode-0500 directory.
+It is mounted at /run/fizz-ssh with `readonly`. A trusted one-time helper copies
+only the single Fizz key into that volume; Paul's SSH directory, shared key,
+agent socket, SSH configuration and credential stores are never mounted.
+SSH uses IdentitiesOnly, IdentityAgent none, strict pinned host verification,
+BatchMode, no password/interactive fallback and no forwarding. Only ag is
+configured; it uses Fizz's key at /run/fizz-ssh/id_ed25519.
+
+This restores the existing explicitly accepted phase-1 authority: Fizz logs
+into ag as paul and GitHub writes there use jaxxon33's existing credential.
+That remains a powerful remote account; a separate key gives attribution and
+revocation, not remote per-agent OS isolation. It is not a claim that ag's files,
+keys or privileges are isolated from Fizz. The key is still readable by Fizz
+and could be copied by a compromised worker; the read-only mount prevents edits,
+not extraction. Remote account separation and the key broker remain later work.
+
+Keep old image IDs for rollback. To rotate Fizz's key, reprovision only its
+credential volume while the pilot is stopped and verify the public fingerprint
+before restarting. Do not change shared SSH credentials or weaken host-key checks.
