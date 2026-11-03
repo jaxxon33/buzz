@@ -19,6 +19,36 @@ pilot.configure(os.environ.get("PILOT_AGENT", "gemma"))
 
 
 class Configuration(unittest.TestCase):
+    def test_start_preserves_provider_url_when_container_dns_cannot_resolve_it(self):
+        self.addCleanup(pilot.configure, pilot.AGENT)
+        pilot.configure("north")
+        environment = {
+            "BUZZ_PRIVATE_KEY": "test-worker-key", "BUZZ_RELAY_URL": "wss://relay.invalid",
+            "BUZZ_AGENT_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "test-provider-key",
+            "OPENROUTER_MODEL": "unchanged-model",
+            "OPENROUTER_BASE_URL": "https://provider.invalid/v1",
+        }
+
+        def inspect(args, **kwargs):
+            value = "127.0.0.1" if args[:2] == ["network", "inspect"] else ""
+            return subprocess.CompletedProcess(args, 0, stdout=value)
+
+        def resolve(host, port, **kwargs):
+            address = "192.0.2.19" if host == "provider.invalid" else "127.0.0.1"
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))]
+
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(pilot, "docker", side_effect=inspect), \
+                mock.patch.object(pilot.socket, "getaddrinfo", side_effect=resolve), \
+                mock.patch.object(pilot.subprocess, "call", return_value=0) as launch:
+            self.assertEqual(pilot.start("sha256:" + "a" * 64), 0)
+            args = launch.call_args.args[0]
+            self.assertIn("provider.invalid:192.0.2.19", args)
+            self.assertIn("relay.invalid:127.0.0.1", args)
+            self.assertIn("OPENROUTER_BASE_URL", args)
+            self.assertNotIn("test-provider-key", args)
+            self.assertEqual(os.environ["OPENROUTER_BASE_URL"], environment["OPENROUTER_BASE_URL"])
+
     def test_agent_profiles_have_distinct_authority_and_workspaces(self):
         original = pilot.AGENT
         profiles = []

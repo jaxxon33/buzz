@@ -194,6 +194,10 @@ Only Fizz can receive SSH/desktop credential mounts. OpenAI-compatible and
 OpenRouter provider settings are preserved independently, including sender
 allowlists; target-undeclared forwarded variables are explicitly unset in the
 unit so manager credentials cannot leak into a different identity.
+The controller resolves the configured provider hostname on the host and adds
+only that address to the container hosts table. Its URL and TLS hostname stay
+unchanged; no host DNS configuration or network namespace is mounted. Addresses
+are refreshed when the service starts.
 
 Check actual workflow and idle state before each move. Activation validates the
 selected image UID, stops the original and proves its PID is gone, then copies

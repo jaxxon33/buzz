@@ -190,6 +190,20 @@ def start(image):
         raise ValueError("Relay URL must have a hostname")
     address = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)[0][4][0]
     args += ["--add-host", f"{host}:127.0.0.1"]
+    # Public DNS is intermittent on this bridge, and MagicDNS is host-only.
+    # Resolve the configured provider on the host without changing its TLS name
+    # or exposing a general-purpose DNS/host-network capability to the worker.
+    provider_url = urlsplit(os.environ.get(
+        "OPENROUTER_BASE_URL" if provider_name == "openrouter" else "OPENAI_COMPAT_BASE_URL",
+        "https://openrouter.ai/api/v1"))
+    if provider_url.hostname and provider_url.hostname != host:
+        try:
+            ipaddress.ip_address(provider_url.hostname)
+        except ValueError:
+            provider_address = socket.getaddrinfo(
+                provider_url.hostname, provider_url.port or 443,
+                family=socket.AF_INET, type=socket.SOCK_STREAM)[0][4][0]
+            args += ["--add-host", f"{provider_url.hostname}:{provider_address}"]
     # Pass variable names, never secret values in the process argument list.
     for key in sorted(FORWARDED.intersection(os.environ)):
         args += ["--env", key]
