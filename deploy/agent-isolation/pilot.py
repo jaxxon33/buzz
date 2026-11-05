@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from urllib.parse import urlsplit
 
 from relay_tunnel import Tunnel
@@ -36,6 +37,7 @@ PROFILES = {
     "omni": (61035, "Omni"), "spark": (61036, "Spark"),
     "venice": (61037, "Venice"),
     "max": (61038, "Max"),
+    "m5": (61039, "m5"),
 }
 WORKSPACE_ROOT = Path('/home/paul/buzz/nests')
 
@@ -183,6 +185,13 @@ def start(image):
                               '{{index .Config.Labels "buzz.isolation.desktop"}}'],
                              capture_output=True, text=True).stdout.strip()
     args = runtime_args(image, ssh=(AGENT == "fizz"), desktop=(desktop_profile == "fizz"))
+    if AGENT == 'max':
+        app_profile = docker(['image', 'inspect', image, '--format',
+                              '{{index .Config.Labels "buzz.isolation.max_app"}}'],
+                             capture_output=True, text=True).stdout.strip()
+        if app_profile != '1':
+            raise ValueError("Max requires its existing Node application in the image")
+        args += ['--publish', '8080:8080']
     # Docker's default resolver cannot resolve the host's private/Tailscale DNS.
     # Resolve only the configured relay on the trusted host, retaining its TLS name.
     host = urlsplit(os.environ["BUZZ_RELAY_URL"]).hostname
@@ -235,19 +244,20 @@ def systemctl(*args):
     return run(["systemctl", "--user", *args], env=env, capture_output=True, text=True)
 
 
-def migrate_workspace(image, source):
+def migrate_workspace(image, source, timeout=900):
     """Called only after the old harness is stopped; no host bind is mounted."""
     expected = workspace.digest(source)
+    helper = NAME + '-copy-' + uuid.uuid4().hex[:12]
     producer = subprocess.Popen(['tar', '-C', str(source), '-cf', '-', '.'],
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
         code = Path(workspace.__file__).read_text()
-        args = ['run', '--rm', '--interactive', '--network', 'none', '--user', '0',
+        args = ['run', '--rm', '--name', helper, '--interactive', '--network', 'none', '--user', '0',
                 '--read-only', '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--cap-add', 'FOWNER',
                 '--security-opt', 'no-new-privileges', '--pids-limit', '64', '--memory', '512m',
                 '--mount', f'type=volume,source={VOLUME},target=/workspace',
                 '--entrypoint', 'python3', image, '-c', code, str(UID)]
-        result = docker(args, stdin=producer.stdout, capture_output=True, text=True, timeout=180)
+        result = docker(args, stdin=producer.stdout, capture_output=True, text=True, timeout=timeout)
         producer.stdout.close()
         if producer.wait(timeout=10) != 0:
             raise RuntimeError('Workspace archive failed; original kept for rollback')
@@ -256,6 +266,10 @@ def migrate_workspace(image, source):
             raise RuntimeError('Workspace changed during migration or copy digest differs')
         print(json.dumps({'workspace_copy': 'verified', **copied}))
     finally:
+        # Killing a timed-out Docker client does not stop its container. Remove
+        # only this disposable helper; keep its private volume and the source.
+        subprocess.run(['docker', 'rm', '--force', helper],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
         producer.stdout.close()
         if producer.poll() is None:
             producer.terminate()

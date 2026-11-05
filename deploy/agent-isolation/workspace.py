@@ -8,11 +8,23 @@ import sys
 import tarfile
 
 
+def entries(root):
+    """Enumerate without silently skipping directories the caller cannot read."""
+    paths = []
+
+    def unreadable(error):
+        raise error
+
+    for base, dirs, files in os.walk(root, onerror=unreadable, followlinks=False):
+        paths.extend(Path(base) / name for name in dirs + files)
+    return sorted(paths)
+
+
 def validate(root):
     root = Path(root)
     if root.is_symlink() or not root.is_dir():
         raise ValueError("Expected the agent's existing real workspace directory")
-    for p in root.rglob('*'):
+    for p in entries(root):
         mode = p.lstat().st_mode
         if stat.S_ISLNK(mode):
             if not p.resolve().is_relative_to(root.resolve()):
@@ -26,7 +38,7 @@ def digest(root):
     root = Path(root)
     h = hashlib.sha256()
     count = 0
-    for p in sorted(root.rglob('*')):
+    for p in entries(root):
         h.update(str(p.relative_to(root)).encode() + b'\0')
         if p.is_symlink():
             h.update(b'L' + os.fsencode(os.readlink(p)))

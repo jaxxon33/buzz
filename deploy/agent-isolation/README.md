@@ -208,3 +208,83 @@ safe relative links are retained. An existing nonempty isolated volume is never
 overwritten. File/link/directory content digests must match before the worker
 starts. Failures restore the old service only after proving the replacement is
 stopped. Validate the agent's actual new tools, chat and work before proceeding.
+
+## Whole native-agent containers
+
+The separate `native.py` controller adds the explicitly selected Claude, Codex,
+Cursor and Omp agents. This supersedes the earlier native-agent exclusion only
+for those profiles; `pilot.py` still controls the simpler buzz-agent family.
+This is an operator rollout, not a new desktop deployment control plane.
+
+`native_build.py` packages the installed adapter and native runtime without
+upgrading either. It records code hashes and immutable base/image identities.
+`reprofile()` reuses a verified runtime image and changes only its worker UID.
+Build contexts contain runtime code and shared instructions, never auth state.
+
+`native_prepare.py` copies the selected agent's workspace, its own runtime
+home/project memory, and its separate SSH key into private named volumes. The
+worker mounts the key read-only, with strict host verification and no shared
+key fallback. Claude-Opus also retains its own desktop key in a separate
+read-only volume. No host home, source repository, control socket or host
+namespace is mounted. The workspace volume is mounted at both `/workspace`
+and the original nest path so saved project and worktree paths remain valid.
+
+This preserves the existing approved remote-account authority: SSH access as
+paul on other machines remains powerful. Separate worker keys provide
+attribution and revocation; they do not isolate that remote account or prevent
+a compromised worker from reading its own key. Provider and Buzz credentials
+also remain available to their selected runtime. Egress is not fully mediated.
+
+Before activation:
+
+1. Confirm every channel session of the selected identity is idle. Do not
+   interrupt a tool job merely because its process looks like a watcher.
+2. Prepare private copies and an agent/image/PID/settings/workspace snapshot.
+   A previous failed preparation is not a usable snapshot. Inspect retained
+   partial volumes and preserve work before deliberately reconciling them.
+3. Resolve external Git worktree metadata into private copies. Copy object
+   data without shared alternates/hardlinks, retain the exact HEAD/index and
+   working files, and verify Git status and object connectivity inside the
+   worker. Never mount the common host repository.
+4. Run `native_check.py` with the unchanged model and a fresh probe label.
+   It drives the real adapter and native shell, independently verifies written
+   bytes and the Git index, and checks an authenticated relay read. Use
+   `--ssh-host ag`, `m2` or `m4` to verify the selected existing remote login.
+   The preflight does not start a second relay-listening identity.
+5. Refresh and verify project memory after in-flight work finishes. Verify
+   additional configured tools separately; listing desktop tools proves
+   discovery, not remote desktop interaction.
+
+Activate with the immutable image and snapshot:
+
+```bash
+python3 deploy/agent-isolation/native.py --agent NAME activate \
+  --image sha256:IMAGE_ID --env-file /path/to/existing-agent.env \
+  --snapshot /path/to/verified-snapshot.json
+```
+
+Activation refuses a changed original PID, settings file or workspace. It
+stops/disables the original before starting the replacement, rechecks the
+workspace after the stop, and restores the original on failure only after
+proving that the replacement is gone. Inspect the actual launch with
+`native.audit()` and exercise a normal relay-driven task after switching.
+A healthy process or a direct adapter preflight alone is not that final check.
+
+Rollback uses `native.py --agent NAME rollback`. Recover any new work from the
+private volumes before resuming editing in the original host workspace.
+Never run both copies of one identity. Moving the active operator's own agent
+requires an independent controller and a verified continuation path.
+
+Full package verification uses the existing `unittest discover` command with
+`PILOT_IMAGE` and `NATIVE_IMAGE` set to the exact images being checked. Set
+`PILOT_AGENT`/`NATIVE_AGENT` to their matching profiles. Native negative controls
+use disposable empty volumes, not production credentials. Workspace validation
+and hashing must fail on unreadable directories instead of silently omitting
+saved work. Timed-out copy helpers are removed by exact disposable container
+name; source files and copied volumes are retained.
+
+Max separately requires an image labelled `buzz.isolation.max_app=1` containing
+its existing Node server. `max_contained.py` supervises that server alongside
+the harness, and the controller retains its existing published port 8080. Its
+unchanged model must work on the host and in the prepared container before a
+service switch; an advertised model listing is not a generation check.

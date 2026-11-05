@@ -49,6 +49,29 @@ class WorkspacePolicy(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('PILOT_IMAGE'),'Set PILOT_IMAGE for real workspace journey')
 class WorkspaceJourney(unittest.TestCase):
+    def test_timed_out_copy_stops_the_container_and_preserves_the_source(self):
+        pilot.configure(os.environ.get('PILOT_AGENT', 'gemma'))
+        image = os.environ['PILOT_IMAGE']
+        volume = 'buzz-workspace-timeout-' + uuid.uuid4().hex[:12]
+        subprocess.run(['docker', 'volume', 'create', volume], check=True, capture_output=True, timeout=15)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                source = Path(directory) / 'source'
+                source.mkdir()
+                (source / 'work.txt').write_text('original work\n')
+                helper = Path(directory) / 'slow_helper.py'
+                helper.write_text('import time; time.sleep(60)\n')
+                with mock.patch.object(pilot, 'VOLUME', volume), \
+                        mock.patch.object(pilot.workspace, '__file__', str(helper)):
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        pilot.migrate_workspace(image, source, timeout=2)
+                self.assertEqual((source / 'work.txt').read_text(), 'original work\n')
+                containers = subprocess.check_output(
+                    ['docker', 'ps', '-aq', '--filter', 'volume=' + volume], text=True, timeout=15)
+                self.assertEqual(containers.strip(), '')
+        finally:
+            subprocess.run(['docker', 'volume', 'rm', volume], check=True, capture_output=True, timeout=20)
+
     def test_content_links_and_worker_writes_survive_copy_and_existing_volume_is_not_overwritten(self):
         pilot.configure(os.environ.get('PILOT_AGENT','gemma'))
         image=os.environ['PILOT_IMAGE']
@@ -65,9 +88,25 @@ assert os.getuid()==UID
 assert pathlib.Path('/workspace/link.txt').read_text()=='saved state\\n'
 assert pathlib.Path('/workspace/link.txt').is_symlink()
 pathlib.Path('/workspace/new.txt').write_text('new work')
+private=pathlib.Path('/workspace/unreadable')
+private.mkdir()
+(private/'pending-work.txt').write_text('Never skip saved work in an unreadable directory')
+private.chmod(0)
+try:
+    for check in [validate,digest]:
+        try:
+            check('/workspace')
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError('Migration accepted an unreadable directory')
+finally:
+    private.chmod(0o700)
 """.replace('UID',str(pilot.UID))
+                    code=Path(workspace.__file__).read_text().split("if __name__ == '__main__':")[0]+code
                     args=pilot.runtime_args(image,name='check-'+volume,volume=volume,entrypoint='python3',network='none')
-                    subprocess.run(['docker',*args,image,'-c',code],check=True,capture_output=True,text=True,timeout=20)
+                    result=subprocess.run(['docker',*args,image,'-c',code],capture_output=True,text=True,timeout=20)
+                    self.assertEqual(result.returncode,0,result.stderr)
                     with self.assertRaises(subprocess.CalledProcessError):
                         pilot.migrate_workspace(image,source)
         finally:
