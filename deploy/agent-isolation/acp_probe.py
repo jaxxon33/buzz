@@ -18,6 +18,7 @@ def probe(command, cwd, model, seconds, label='native-check-20261104', with_mcp=
     selector = selectors.DefaultSelector()
     selector.register(child.stdout, selectors.EVENT_READ)
     counter = 0
+    pending = b''
     updates = {}
 
     def send(value):
@@ -25,17 +26,25 @@ def probe(command, cwd, model, seconds, label='native-check-20261104', with_mcp=
         child.stdin.flush()
 
     def request(method, params):
-        nonlocal counter
+        nonlocal counter, pending
         counter += 1
         number = counter
         send({'jsonrpc': '2.0', 'id': number, 'method': method, 'params': params})
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            if not selector.select(max(0, deadline - time.monotonic())):
-                break
-            line = child.stdout.readline()
-            if not line:
-                raise RuntimeError('Adapter exited')
+            # TextIOWrapper.readline() may prefetch the next RPC reply.
+            # Read raw bytes and drain complete buffered lines before polling
+            # the descriptor again, including updates batched with completion.
+            if b'\n' not in pending:
+                if not selector.select(max(0, deadline - time.monotonic())):
+                    break
+                chunk = os.read(child.stdout.fileno(), 65536)
+                if not chunk:
+                    raise RuntimeError('Adapter exited')
+                pending += chunk
+                if b'\n' not in pending:
+                    continue
+            line, pending = pending.split(b'\n', 1)
             message = json.loads(line)
             if message.get('method') == 'session/update':
                 update = message.get('params', {}).get('update', {})
@@ -99,6 +108,8 @@ def probe(command, cwd, model, seconds, label='native-check-20261104', with_mcp=
             child.kill()
             child.wait()
         selector.close()
+        child.stdin.close()
+        child.stdout.close()
 
 
 if __name__ == '__main__':

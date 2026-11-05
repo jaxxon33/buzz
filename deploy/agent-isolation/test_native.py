@@ -160,3 +160,40 @@ print('native_shell_boundary=passed')
                         self.assertIn('native_shell_boundary=passed', result.stdout)
                 finally:
                     pilot.docker(['rm', '--force', name], capture_output=True)
+
+
+class NativeProbeJourney(unittest.TestCase):
+    def test_batched_adapter_updates_do_not_hide_the_completion_reply(self):
+        import acp_probe
+        import contextlib
+        import io
+        import sys
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = root / 'adapter.py'
+            adapter.write_text('''import json,sys,subprocess
+from pathlib import Path
+for line in sys.stdin:
+    request=json.loads(line)
+    method=request['method']
+    if method=='initialize':
+        result={'protocolVersion':1,'agentInfo':{'name':'batched-adapter'}}
+    elif method=='session/new':
+        result={'sessionId':'local-session'}
+    elif method=='session/prompt':
+        p=Path('REPOS/batched-probe');p.mkdir(parents=True)
+        (p/'result.txt').write_text('370\\n')
+        subprocess.run(['git','init','-q',str(p)],check=True)
+        subprocess.run(['git','-C',str(p),'add','result.txt'],check=True)
+        result={'stopReason':'end_turn'}
+    else:raise RuntimeError('Unexpected method')
+    update={'jsonrpc':'2.0','method':'session/update','params':{'update':{'sessionUpdate':'agent_message_chunk'}}}
+    reply={'jsonrpc':'2.0','id':request['id'],'result':result}
+    # Keep the connection open; both lines arrive in one write, as real
+    # adapters may send their final update and RPC completion together.
+    sys.stdout.write(json.dumps(update)+'\\n'+json.dumps(reply)+'\\n');sys.stdout.flush()
+''')
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                acp_probe.probe([sys.executable,str(adapter)],str(root),None,2,'batched-probe')
+            self.assertIn('"native_model_tools": "passed"',output.getvalue())
