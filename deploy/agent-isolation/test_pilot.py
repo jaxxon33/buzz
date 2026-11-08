@@ -187,6 +187,7 @@ class BoundaryJourney(unittest.TestCase):
             code = r'''
 import json, os, pathlib, selectors, subprocess, sys, time
 canary = sys.argv[1]
+legacy_workspace = sys.argv[2]
 assert os.getuid() == 61021 and os.getgid() == 61021
 assert os.getgroups() == [61021], os.getgroups()
 status = pathlib.Path('/proc/self/status').read_text()
@@ -194,12 +195,16 @@ assert 'NoNewPrivs:\t1' in status
 assert 'CapEff:\t0000000000000000' in status
 root_mount = next(line for line in pathlib.Path('/proc/mounts').read_text().splitlines() if line.split()[1] == '/')
 assert 'ro' in root_mount.split()[3].split(','), root_mount
-for path in (canary, '/home/paul', '/root/.ssh', '/var/run/docker.sock',
+for path in (canary, '/home/paul/.ssh', '/root/.ssh', '/var/run/docker.sock',
              '/run/docker.sock', '/run/user/1000/bus'):
     try:
         assert not pathlib.Path(path).exists(), path
     except PermissionError:
         pass
+if legacy_workspace:
+    assert set(pathlib.Path('/home/paul').iterdir()) == {pathlib.Path('/home/paul/buzz')}
+else:
+    assert not pathlib.Path('/home/paul').exists()
 try:
     pathlib.Path('/opt/buzz/base-prompt.md').write_text('changed')
     raise AssertionError('launcher image is writable')
@@ -220,6 +225,18 @@ subprocess.run(['git', '-C', str(repo), 'config', 'user.email', 'probe@example.i
 repo.joinpath('README.md').write_text('isolated repository\n')
 subprocess.run(['git', '-C', str(repo), 'add', 'README.md'], check=True)
 subprocess.run(['git', '-C', str(repo), 'commit', '-qm', 'Verify isolated repository writes'], check=True)
+if legacy_workspace:
+    # Create the absolute metadata Git writes in Max's original nest, then
+    # use the worktree through /workspace as the contained app/tools do.
+    original_repo = pathlib.Path(legacy_workspace) / 'REPOS/pilot'
+    original_worktree = pathlib.Path(legacy_workspace) / 'REPOS/backend'
+    subprocess.run(['git', '-C', str(original_repo), 'worktree', 'add', '--detach',
+                    str(original_worktree), 'HEAD'], check=True, capture_output=True)
+    worktree = pathlib.Path('/workspace/REPOS/backend')
+    worktree.joinpath('pending.txt').write_text('saved worktree changes\n')
+    subprocess.run(['git', '-C', str(worktree), 'add', 'pending.txt'], check=True)
+    assert subprocess.check_output(['git', '-C', str(worktree), 'show', ':pending.txt']) == b'saved worktree changes\n'
+    assert subprocess.check_output(['git', '-C', str(repo), 'status', '--porcelain']) == b''
 # Exercise the actual MCP shell, which must inherit the worker's restrictions.
 p = subprocess.Popen(['/opt/buzz/bin/buzz-dev-mcp'], stdin=subprocess.PIPE,
                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
@@ -245,7 +262,7 @@ try:
     p.stdin.write(json.dumps({'jsonrpc':'2.0','method':'notifications/initialized'})+'\n');p.stdin.flush()
     result=call(2,'tools/call',{'name':'shell','arguments':{'command':
         'test "$(id -u)" = 61021 && test ! -e '+canary+
-        ' && test ! -e /home/paul && test ! -S /var/run/docker.sock'+
+        ' && test ! -e /home/paul/.ssh && test ! -S /var/run/docker.sock'+
         ' && git -C /workspace/REPOS/pilot status --porcelain && echo MCP_BOUNDARY_PASS'}})
     assert not result.get('isError'), result
     assert 'MCP_BOUNDARY_PASS' in json.dumps(result), result
@@ -255,11 +272,13 @@ finally:
     except subprocess.TimeoutExpired: p.kill();p.wait()
 print(json.dumps({'uid':os.getuid(),'host_files':'blocked','host_processes':'hidden',
                   'launcher_changes':'blocked','docker_control':'absent',
-                  'repo_commit':'passed','real_mcp_shell':'passed'}))
+                  'repo_commit':'passed','real_mcp_shell':'passed',
+                  'absolute_worktree':'passed' if legacy_workspace else 'not_applicable'}))
 '''
             try:
                 args = pilot.runtime_args(image, name, volume, entrypoint="python3", network="none")
-                args += ["--interactive", image, "-", marker.name]
+                legacy = str(pilot.WORKSPACE_ROOT / pilot.AGENT) if pilot.AGENT == "max" else ""
+                args += ["--interactive", image, "-", marker.name, legacy]
                 code = code.replace("61021", str(pilot.UID))
                 if pilot.AGENT == "fizz":
                     code = code.replace("canary = sys.argv[1]", """canary = sys.argv[1]
@@ -279,6 +298,8 @@ assert 'identityagent none' in ssh_config
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 report = json.loads(result.stdout)
                 self.assertEqual(report["real_mcp_shell"], "passed")
+                if pilot.AGENT == "max":
+                    self.assertEqual(report["absolute_worktree"], "passed")
                 print(json.dumps(report, sort_keys=True))
             finally:
                 subprocess.run(["docker", "rm", "--force", name], capture_output=True, timeout=20)

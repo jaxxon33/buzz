@@ -100,6 +100,9 @@ def runtime_args(image, name=None, volume=None, entrypoint=None, network="bridge
             "--tmpfs", "/run:rw,noexec,nosuid,nodev,size=16m,mode=755",
             "--mount", f"type=volume,source={volume},target=/workspace",
             "--workdir", "/workspace", "--log-driver", "none"]
+    if AGENT == "max":
+        # Existing Git worktrees store absolute paths to Max's original nest.
+        args += ["--mount", f"type=volume,source={volume},target={WORKSPACE_ROOT / AGENT},volume-nocopy"]
     if ssh:
         if AGENT != "fizz":
             raise ValueError("Only the Fizz pilot has an approved SSH credential mount")

@@ -288,3 +288,6 @@ its existing Node server. `max_contained.py` supervises that server alongside
 the harness, and the controller retains its existing published port 8080. Its
 unchanged model must work on the host and in the prepared container before a
 service switch; an advertised model listing is not a generation check.
+Max's private workspace volume also appears at its original nest path so saved
+absolute Git worktree links keep working. This mounts the same private volume
+at two paths; it does not mount the original host workspace or host home.
