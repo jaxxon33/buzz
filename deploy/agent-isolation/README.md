@@ -8,6 +8,51 @@ inside the same boundary.
 
 ## Scope
 
+### New VM workers
+
+`pilot.py --agent NAME provision --env-file /absolute/buzz-acp-NAME.env
+--image sha256:COMMON_BASE_ID` provisions a new **buzz-agent** worker using the
+existing OpenAI-compatible or OpenRouter backend. Native adapters are refused;
+this command does not provision their authentication or images. The calling
+service/operator must select a trusted, credential-free common image and supply
+the new worker's own complete mode-0600 environment file. No provider account,
+membership, admin role, SSH key or desktop access is created by this command.
+
+The host registry `~/.config/buzz-agent-isolation/profiles/` holds private,
+atomic per-name records. A process lock serializes reservation and activation.
+New worker UIDs/GIDs come from 62000–64999, excluding host accounts/groups and
+all retained reservations. The controller builds a credential-free derivative
+with that worker identity, pins its actual image ID in the service and registry,
+and checks that the fresh workspace volume is empty, correctly owned and writable.
+It uses the same confinement arguments as existing workers, with exactly one
+private workspace mount. Existing names, nonempty workspaces, units (including
+dangling symlinks), volumes, containers and active/enabled host copies are refused.
+
+Provisioning never starts a `buzz-acp@` host service. A failed operation retains
+its UID/name reservation, image and private storage for deliberate operator
+recovery, and attempts to stop/disable only its own replacement service. Do not
+delete a reservation or reuse a failed name until the operator has inspected
+its service/container/storage. Successfully provisioned workers support `run`
+through their installed isolated unit; use systemd to stop/start that unit.
+They cannot invoke the legacy migration/rollback commands that restore host
+services. A successful provision means the container started; a real
+relay/model/file/Git workflow must still be verified before declaring it usable.
+
+This is VM-side provisioning only. Desktop-local drafts launch through the
+Desktop's managed-agent runtime directly; a systemd host-service guard does not
+cover that separate execution path. The Hive caller must refuse unsupported
+backends before creating identities, use relay `member` privileges and channel
+`bot` membership, and keep creation unavailable until its rollout is verified.
+
+Full-package verification includes a synthetic, networkless real Docker
+derivative/storage journey when `PILOT_IMAGE` is set. That journey substitutes
+systemd; it does not register an agent, start a live harness or prove the Hive
+creation flow. It independently reads the resulting bytes from the private
+volume. Other tests cover reservation collisions, failed starts, incorrect
+image identity/pins and unsafe base configurations.
+
+### Existing pilots
+
 The supported pilots are Gemma (UID/GID 61021) and Fizz (UID/GID 61022). Each has
 its own service, container, private named workspace volume,
 a read-only image and private PID/mount/network namespaces. No host home,

@@ -43,12 +43,21 @@ WORKSPACE_ROOT = Path('/home/paul/buzz/nests')
 
 
 def configure(agent):
-    """Only explicitly authorised buzz-agent profiles can use this controller."""
+    """Select an existing pilot or a successfully provisioned private profile."""
+    if agent in PROFILES:
+        uid, display_name = PROFILES[agent]
+    else:
+        import provision
+        record = provision.load_profile(agent)
+        uid, display_name = record['uid'], agent
+    configure_profile(agent, uid, display_name)
+
+
+def configure_profile(agent, uid, display_name):
+    """Set controller names after the caller validates or reserves the profile."""
     global AGENT, DISPLAY_NAME, NAME, VOLUME, LABEL, UID, ORIGINAL_SERVICE
-    if agent not in PROFILES:
-        raise ValueError("Unsupported isolation pilot")
     AGENT = agent
-    UID, DISPLAY_NAME = PROFILES[agent]
+    UID, DISPLAY_NAME = uid, display_name
     NAME = "buzz-isolated-" + agent
     VOLUME = NAME + "-workspace"
     LABEL = "buzz.isolation.pilot=" + agent
@@ -174,6 +183,10 @@ Host ag
 
 
 def start(image):
+    if AGENT not in PROFILES:
+        import provision
+        if provision.load_profile(AGENT)['image'] != image:
+            raise ValueError('Provisioned image differs from its reserved profile')
     required = {"BUZZ_PRIVATE_KEY", "BUZZ_RELAY_URL"}
     provider_name = os.environ.get("BUZZ_AGENT_PROVIDER")
     if provider_name == "openai":
@@ -432,7 +445,7 @@ def rollback(keep_original_stopped=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--agent", choices=tuple(PROFILES), default="gemma")
+    parser.add_argument("--agent", default="gemma")
     commands = parser.add_subparsers(dest="command", required=True)
     p = commands.add_parser("build")
     p.add_argument("--context", required=True)
@@ -449,8 +462,17 @@ def main():
             p.add_argument("--snapshot")
     p = commands.add_parser("rollback")
     p.add_argument("--keep-original-stopped", action="store_true")
+    p = commands.add_parser("provision")
+    p.add_argument("--env-file", required=True)
+    p.add_argument("--image", required=True, type=image_id)
     args = parser.parse_args()
+    if args.command == 'provision':
+        import provision
+        provision.provision(sys.modules[__name__], args.agent, args.env_file, args.image)
+        return
     configure(args.agent)
+    if args.agent not in PROFILES and args.command != 'run':
+        raise ValueError('Provisioned agents support run only; stop/start their isolated service')
     if args.command == "build":
         build(args.context, args.binary_dir, args.prompt, args.ag_host, args.known_hosts)
     elif args.command == "run":
