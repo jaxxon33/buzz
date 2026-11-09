@@ -10,10 +10,96 @@ from unittest import mock
 import uuid
 
 import native
+import native_sandbox
 import pilot
 
 
 class NativeConfiguration(unittest.TestCase):
+    def test_explicit_policy_is_pinned_to_selected_agents_and_snapshot(self):
+        self.addCleanup(native.configure, 'claude-haiku')
+        image = 'sha256:' + 'a' * 64
+        for agent in ['codex', 'sol']:
+            native.configure(agent, codex_sandbox=True)
+            with mock.patch.object(native_sandbox, 'verify', return_value=dict(native_sandbox.FILES)) as verified:
+                args = native.runtime_args(image)
+                self.assertIn('apparmor=' + native_sandbox.APPARMOR, args)
+                self.assertIn('seccomp=' + str(native_sandbox.ROOT / 'codex-seccomp-v1.json'), args)
+                verified.assert_called_once()
+            with mock.patch.object(native_sandbox, 'verify', side_effect=ValueError('changed installed policy')):
+                with self.assertRaises(ValueError):
+                    native.runtime_args(image)
+        for agent in set(native.PROFILES) - {'codex', 'sol'}:
+            with self.assertRaises(ValueError):
+                native.configure(agent, codex_sandbox=True)
+        native.configure('codex')
+        self.assertFalse(any(arg.startswith(('apparmor=', 'seccomp=')) for arg in native.runtime_args(image)))
+
+    def test_installed_policy_integrity_and_daemon_inspection(self):
+        contents = {name: Path(__file__).with_name(name).read_bytes() for name in native_sandbox.FILES}
+        for name, raw in contents.items():
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), native_sandbox.FILES[name])
+        original_lstat, original_fstat = Path.lstat, os.fstat
+
+        def owned(metadata, uid=0):
+            values = list(metadata)
+            values[4] = uid
+            return os.stat_result(values)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'policy'
+            root.mkdir(mode=0o755)
+            for name, raw in contents.items():
+                (root / name).write_bytes(raw)
+                (root / name).chmod(0o644)
+            (root / native_sandbox.APPARMOR).write_bytes(contents['codex-apparmor-v1.profile'])
+            (root / native_sandbox.APPARMOR).chmod(0o644)
+            with mock.patch.object(native_sandbox, 'ROOT', root), \
+                    mock.patch.object(native_sandbox, 'PROFILE', root / native_sandbox.APPARMOR), \
+                    mock.patch.object(Path, 'lstat', lambda path: owned(original_lstat(path))), \
+                    mock.patch.object(os, 'fstat', lambda fd: owned(original_fstat(fd))):
+                self.assertEqual(native_sandbox.verify(), native_sandbox.FILES)
+                selected = root / 'codex-seccomp-v1.json'
+                selected.write_bytes(b'{}')
+                with self.assertRaises(ValueError):
+                    native_sandbox.verify()
+                selected.write_bytes(contents[selected.name])
+                selected.chmod(0o666)
+                with self.assertRaises(ValueError):
+                    native_sandbox.verify()
+                selected.chmod(0o644)
+                selected.unlink()
+                selected.symlink_to(root / 'codex-apparmor-v1.profile')
+                with self.assertRaises(OSError):
+                    native_sandbox.verify()
+            with mock.patch.object(native_sandbox, 'ROOT', root), \
+                    mock.patch.object(native_sandbox, 'PROFILE', root / native_sandbox.APPARMOR):
+                with self.assertRaises(ValueError):
+                    native_sandbox.verify()
+
+        self.addCleanup(native.configure, 'claude-haiku')
+        native.configure('codex', codex_sandbox=True)
+        options = ['no-new-privileges:true', 'apparmor=' + native_sandbox.APPARMOR,
+                   'seccomp=' + json.dumps(json.loads(contents['codex-seccomp-v1.json']), separators=(',', ':'))]
+        data = {'Config': {'User': '61043:61043'}, 'AppArmorProfile': native_sandbox.APPARMOR,
+                'HostConfig': {'SecurityOpt': options, 'NetworkMode': 'bridge', 'PidMode': '',
+                               'IpcMode': 'private', 'Privileged': False, 'ReadonlyRootfs': True,
+                               'CapAdd': None, 'CapDrop': ['ALL']},
+                'Mounts': [{'Type': 'volume', 'Destination': destination, 'Name': 'buzz-isolated-codex-' + suffix, 'RW': writable}
+                           for destination, suffix, writable in [('/workspace', 'workspace', True),
+                           ('/home/paul/buzz/nests/codex', 'workspace', True),
+                           ('/home/paul', 'home', True), ('/home/paul/.ssh', 'ssh', False)]]}
+        with mock.patch.object(native_sandbox, '_read_verified', return_value=contents), \
+                mock.patch.object(pilot, 'docker', side_effect=lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=json.dumps([data]))):
+            native.audit('synthetic-daemon-record')
+            for mutation in ['seccomp=unconfined', 'seccomp={}', 'apparmor=unconfined']:
+                data['HostConfig']['SecurityOpt'] = options[:2] + [mutation]
+                with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                    native.audit('synthetic-daemon-record')
+            data['HostConfig']['SecurityOpt'] = options
+            data['AppArmorProfile'] = 'unconfined'
+            with self.assertRaises(ValueError):
+                native.audit('synthetic-daemon-record')
+
     def test_profiles_keep_workspace_paths_and_separate_home_and_readonly_key(self):
         original = pilot.AGENT
         self.addCleanup(pilot.configure, original)
@@ -35,9 +121,10 @@ class NativeMigrationJourney(unittest.TestCase):
     def test_settings_snapshot_and_failed_replacement_never_lose_work_or_duplicate_identity(self):
         original = pilot.AGENT
         self.addCleanup(pilot.configure, original)
-        native.configure('claude-haiku')
         image = 'sha256:' + 'a' * 64
-        for scenario in ['changed-settings', 'failed-start', 'replacement-still-running']:
+        for scenario in ['changed-settings', 'changed-policy', 'failed-start', 'replacement-still-running', 'policy-failed-start']:
+            native.configure('codex' if scenario == 'policy-failed-start' else 'claude-haiku',
+                             codex_sandbox=scenario == 'policy-failed-start')
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 home = Path(directory)
                 (home / '.config/systemd/user').mkdir(parents=True)
@@ -50,6 +137,8 @@ class NativeMigrationJourney(unittest.TestCase):
                 record = {'agent': pilot.AGENT, 'image': image, 'original_pid': 123,
                           'workspace': native.workspace.digest(source),
                           'environment_file_sha256': hashlib.sha256(env_file.read_bytes()).hexdigest()}
+                if scenario in ['changed-policy', 'policy-failed-start']:
+                    record['sandbox_policy'] = dict(native_sandbox.FILES)
                 snapshot = home / 'snapshot.json'
                 snapshot.write_text(json.dumps(record))
                 if scenario == 'changed-settings':
@@ -84,6 +173,7 @@ class NativeMigrationJourney(unittest.TestCase):
                     return original_service(*args)
 
                 with mock.patch.object(pilot.Path, 'home', return_value=home), \
+                        mock.patch.object(native_sandbox, 'verify', return_value=dict(native_sandbox.FILES)), \
                         mock.patch.object(pilot, 'WORKSPACE_ROOT', root), \
                         mock.patch.object(pilot, 'systemctl', side_effect=service_with_stop), \
                         mock.patch.object(pilot, 'docker', side_effect=docker):
@@ -91,9 +181,9 @@ class NativeMigrationJourney(unittest.TestCase):
                         native.activate(image, env_file, snapshot)
                 self.assertEqual((source / 'work.txt').read_text(), 'original work\n')
                 restore = ('enable', '--now', pilot.ORIGINAL_SERVICE)
-                if scenario == 'changed-settings':
+                if scenario in ['changed-settings', 'changed-policy']:
                     self.assertNotIn(('disable', '--now', pilot.ORIGINAL_SERVICE), calls)
-                elif scenario == 'failed-start':
+                elif scenario in ['failed-start', 'policy-failed-start']:
                     self.assertLess(calls.index(('disable', '--now', pilot.NAME + '.service')), calls.index(restore))
                 else:
                     self.assertNotIn(restore, calls)
@@ -104,7 +194,8 @@ class NativeBoundaryJourney(unittest.TestCase):
     def test_real_launch_and_mutated_authority(self):
         original = pilot.AGENT
         self.addCleanup(pilot.configure, original)
-        native.configure(os.environ.get('NATIVE_AGENT', 'claude-haiku'))
+        native.configure(os.environ.get('NATIVE_AGENT', 'claude-haiku'),
+                         codex_sandbox=os.environ.get('NATIVE_SANDBOX') == '1')
         image = pilot.image_id(os.environ['NATIVE_IMAGE'])
         prefix = 'buzz-native-test-' + uuid.uuid4().hex[:12]
         volumes = [prefix + suffix for suffix in ['-workspace', '-home', '-ssh']]
@@ -158,6 +249,11 @@ except OSError: pass
 print('native_shell_boundary=passed')
 '''], capture_output=True, text=True)
                         self.assertIn('native_shell_boundary=passed', result.stdout)
+                        if native.CODEX_SANDBOX:
+                            code = Path(__file__).with_name('codex_sandbox_probe.py').read_text()
+                            result = pilot.docker(['exec', name, 'python3', '-c', code],
+                                                  capture_output=True, text=True, timeout=40)
+                            self.assertEqual(json.loads(result.stdout)['native_inner_sandbox'], 'passed')
                 finally:
                     pilot.docker(['rm', '--force', name], capture_output=True)
 

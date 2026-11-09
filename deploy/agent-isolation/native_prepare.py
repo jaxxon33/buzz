@@ -10,6 +10,7 @@ import tempfile
 import native
 import pilot
 import workspace
+import native_sandbox
 
 
 def copy(source, target):
@@ -32,8 +33,9 @@ def transfer(image, source, volume):
         pilot.VOLUME = previous
 
 
-def prepare(agent, image, snapshot):
-    family = native.configure(agent)
+def prepare(agent, image, snapshot, codex_sandbox=False):
+    family = native.configure(agent, codex_sandbox=codex_sandbox)
+    policy = native_sandbox.verify() if codex_sandbox else None
     source_home = Path('/home/paul')
     source = workspace.validate(pilot.WORKSPACE_ROOT / agent)
     before = workspace.digest(source)
@@ -135,7 +137,8 @@ Host m4
     env_file = source_home / '.config/buzz-agents' / f'buzz-acp-{agent}.env'
     snapshot.write_text(json.dumps({'agent': agent, 'image': image, 'workspace': before,
                                    'original_pid': pid,
-                                   'environment_file_sha256': hashlib.sha256(env_file.read_bytes()).hexdigest()}, indent=2) + '\n')
+                                   'environment_file_sha256': hashlib.sha256(env_file.read_bytes()).hexdigest(),
+                                   'sandbox_policy': policy}, indent=2) + '\n')
     print('Private native state and workspace copies verified')
 
 
@@ -144,5 +147,6 @@ if __name__ == '__main__':
     parser.add_argument('--agent', required=True, choices=native.PROFILES)
     parser.add_argument('--image', required=True, type=pilot.image_id)
     parser.add_argument('--snapshot', required=True)
+    parser.add_argument('--codex-sandbox', action='store_true')
     args = parser.parse_args()
-    prepare(args.agent, args.image, args.snapshot)
+    prepare(args.agent, args.image, args.snapshot, args.codex_sandbox)

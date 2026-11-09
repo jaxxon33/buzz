@@ -13,6 +13,9 @@ from urllib.parse import urlsplit
 
 import pilot
 import workspace
+import native_sandbox
+
+CODEX_SANDBOX = False
 
 PROFILES = {
     'claude-haiku': (61040, 'Claude-Haiku', 'claude'),
@@ -33,10 +36,14 @@ FORWARDED = pilot.FORWARDED | {
 }
 
 
-def configure(agent):
+def configure(agent, codex_sandbox=False):
+    global CODEX_SANDBOX
+    if codex_sandbox and agent not in {'codex', 'sol'}:
+        raise ValueError('The reviewed sandbox policy is only for Codex and Sol')
     uid, display, family = PROFILES[agent]
     pilot.PROFILES[agent] = (uid, display)
     pilot.configure(agent)
+    CODEX_SANDBOX = codex_sandbox
     return family
 
 
@@ -58,6 +65,9 @@ def runtime_args(image, name=None, entrypoint=None, network='bridge', volume_pre
              '--env', 'BUZZ_ACP_AGENT_ARGS=' + ('acp' if PROFILES[pilot.AGENT][2] in {'cursor', 'omp'} else '')]
     if pilot.AGENT == 'claude-opus':
         args += ['--mount', f'type=volume,source={prefix}-desktop,target=/home/paul/.config/desktop-mcp,readonly,volume-nocopy']
+    if CODEX_SANDBOX:
+        for option in native_sandbox.security_options():
+            args += ['--security-opt', option]
     return args
 
 
@@ -66,6 +76,11 @@ def audit(name, prefix=None):
     prefix = prefix or pilot.NAME
     data = json.loads(pilot.docker(['inspect', name], capture_output=True, text=True).stdout)[0]
     host = data['HostConfig']
+    if CODEX_SANDBOX:
+        native_sandbox.audit_options(host['SecurityOpt'], data['AppArmorProfile'])
+    elif (host['SecurityOpt'] != ['no-new-privileges:true'] or
+          data['AppArmorProfile'] != 'docker-default'):
+        raise ValueError('Container security policy does not match the selected native boundary')
     if (data['Config']['User'] != f'{pilot.UID}:{pilot.UID}' or
             host['NetworkMode'] != 'bridge' or host['PidMode'] or
             host['IpcMode'] != 'private' or host['Privileged'] or
@@ -87,7 +102,7 @@ def audit(name, prefix=None):
     print(json.dumps({'native_boundary': 'passed', 'uid': pilot.UID, 'container': name}))
 
 
-def start(image):
+def start(image, volume_prefix=None):
     pilot.image_id(image)
     family = PROFILES[pilot.AGENT][2]
     actual = pilot.docker(['image', 'inspect', image, '--format',
@@ -95,7 +110,7 @@ def start(image):
                           capture_output=True, text=True).stdout.strip()
     if actual != family:
         raise ValueError('Image runtime does not match the selected agent')
-    args = runtime_args(image)
+    args = runtime_args(image, volume_prefix=volume_prefix)
     relay = urlsplit(os.environ['BUZZ_RELAY_URL']).hostname
     if not relay:
         raise ValueError('Missing relay hostname')
@@ -132,6 +147,9 @@ def activate(image, env_file, snapshot):
     script = Path(__file__).resolve()
     env_file = Path(env_file).resolve(strict=True)
     record = json.loads(Path(snapshot).read_text())
+    expected_policy = native_sandbox.verify() if CODEX_SANDBOX else None
+    if record.get('sandbox_policy') != expected_policy:
+        raise ValueError('Snapshot sandbox policy does not match selected launch')
     if record['agent'] != pilot.AGENT or record['image'] != image:
         raise ValueError('Snapshot belongs to a different agent/image')
     if hashlib.sha256(env_file.read_bytes()).hexdigest() != record['environment_file_sha256']:
@@ -172,7 +190,7 @@ Type=simple
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 EnvironmentFile={env_file}
 UnsetEnvironment={unset}
-ExecStart=/usr/bin/python3 "{script}" --agent {pilot.AGENT} run --image {image}
+ExecStart=/usr/bin/python3 "{script}" --agent {pilot.AGENT} run --image {image}{' --codex-sandbox' if CODEX_SANDBOX else ''}
 ExecStop=/usr/bin/docker stop --time 25 {pilot.NAME}
 Restart=on-failure
 RestartSec=15
@@ -221,8 +239,9 @@ if __name__ == '__main__':
     parser.add_argument('--image', type=pilot.image_id)
     parser.add_argument('--env-file')
     parser.add_argument('--snapshot')
+    parser.add_argument('--codex-sandbox', action='store_true', help='Require the explicitly installed, hash-pinned Codex/Sol sandbox policy')
     args = parser.parse_args()
-    configure(args.agent)
+    configure(args.agent, codex_sandbox=args.codex_sandbox)
     if args.command == 'rollback':
         pilot.rollback()
     elif args.command == 'activate':

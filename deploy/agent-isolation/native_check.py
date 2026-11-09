@@ -9,8 +9,8 @@ import native
 import pilot
 
 
-def check(agent, image, label, ssh_host=None):
-    family = native.configure(agent)
+def check(agent, image, label, ssh_host=None, codex_sandbox=False, volume_prefix=None):
+    family = native.configure(agent, codex_sandbox=codex_sandbox)
     # Preflight never runs a second relay-listening harness for the identity.
     # The temporary container runs only the task adapter plus signed CLI reads.
     pid = int(pilot.systemctl('show', pilot.ORIGINAL_SERVICE, '-p', 'MainPID', '--value').stdout)
@@ -61,7 +61,7 @@ print("native_ssh=passed",flush=True)
         os.environ.clear()
         os.environ.update(env)
         pilot.subprocess.call = probe
-        return native.start(image)
+        return native.start(image, volume_prefix=volume_prefix)
     finally:
         pilot.subprocess.call = original_call
         os.environ.clear()
@@ -74,5 +74,7 @@ if __name__ == '__main__':
     parser.add_argument('--image', required=True, type=pilot.image_id)
     parser.add_argument('--label', default='native-check-20261104')
     parser.add_argument('--ssh-host')
+    parser.add_argument('--codex-sandbox', action='store_true')
+    parser.add_argument('--volume-prefix', help='Use separate prepared private volumes for this preflight')
     args = parser.parse_args()
-    raise SystemExit(check(args.agent, args.image, args.label, args.ssh_host))
+    raise SystemExit(check(args.agent, args.image, args.label, args.ssh_host, args.codex_sandbox, args.volume_prefix))

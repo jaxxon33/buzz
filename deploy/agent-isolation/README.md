@@ -288,6 +288,49 @@ its existing Node server. `max_contained.py` supervises that server alongside
 the harness, and the controller retains its existing published port 8080. Its
 unchanged model must work on the host and in the prepared container before a
 service switch; an advertised model listing is not a generation check.
+
+## Explicit Codex/Sol inner-sandbox policy
+
+The default launch remains unchanged. Only Codex and Sol accept the explicit
+`--codex-sandbox` option on native preparation, preflight and activation. It
+requires a separately reviewed administrator installation of the exact
+`codex-apparmor-v1.profile` and `codex-seccomp-v1.json` bytes under
+`/etc/buzz-agent-isolation`, plus the identical AppArmor profile at
+`/etc/apparmor.d/buzz-native-codex-v1` for boot persistence. Directories and
+files must be root-owned, not group/world writable, and not symlinks. The
+controller hashes the files before use and refuses missing or changed bytes.
+The administrator must load the exact named profile in enforcing mode.
+
+This is an exception to the earlier stock-profile contract, requiring explicit
+approval before installation or credential-bearing tests. The seccomp candidate
+retains its reviewed upstream base and adds the exact user/mount/PID/network
+namespace flag combinations needed by the native sandbox, plus mount, umount2,
+pivot_root and chroot. The named AppArmor derivative permits mount and pivot_root
+and retains the other rendered upstream rules. Its upstream comparison has not
+been proven identical to the installed Docker engine's compiled default. Mount
+authority is broader inside these selected containers; this is not a claim of
+equivalence to Docker's defaults. No outer capability, privileged mode, host
+namespace, bind mount, worker Docker access or full-access Codex mode is added.
+
+Policy selection is bound into the preparation snapshot and generated service
+command. Activation refuses a mismatched or omitted selection; Docker refuses
+an unavailable named profile. Audit compares Docker's recorded seccomp JSON to
+the verified installed policy and requires the exact AppArmor name, alongside
+the existing UID, mount, namespace, read-only-root and capability checks.
+
+`native_check.py --volume-prefix NAME` can test fresh separate private volumes
+without altering the retained production/rollback copies. These copies and any
+credential provisioning require their own authorization. A preflight never
+starts a second relay-listening harness. It is not a cutover snapshot.
+
+After explicit administrator installation, run the full package with the
+matching images and `NATIVE_AGENT=codex NATIVE_SANDBOX=1`. The native boundary
+journey then also drives the actual built-in Codex sandbox. It proves parent
+write/connect controls work, file/UID/Git work succeeds, and the inner sandbox
+denies the same outside write and network connection. Keep the real configured
+model/file/Git/relay/SSH preflight, preservation/idle checks, exact switch review
+and post-switch relay workflow as separate remaining gates. Existing agents
+do not acquire this policy unless explicitly selected at their own restart.
 Max's private workspace volume also appears at its original nest path so saved
 absolute Git worktree links keep working. This mounts the same private volume
 at two paths; it does not mount the original host workspace or host home.
