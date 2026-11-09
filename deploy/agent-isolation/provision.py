@@ -6,6 +6,7 @@ The invoking operator/service owns the profile registry and Docker access.
 import fcntl
 from contextlib import contextmanager
 import grp
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,10 +28,11 @@ def validate_name(agent):
         raise ValueError('Agent name must be 1-48 lowercase letters, digits or hyphens')
 
 
-def load_profile(agent):
+def load_profile(agent, states=('ready',)):
     validate_name(agent)
     record = json.loads((ROOT / (agent + '.json')).read_text())
-    if (record.get('agent') != agent or record.get('state') != 'ready' or
+    if (record.get('agent') != agent or record.get('state') not in states or
+            record.get('family', 'buzz-agent') not in {'buzz-agent', 'claude'} or
             type(record.get('uid')) is not int or
             not UID_START <= record['uid'] <= UID_END or
             not re.fullmatch(r'sha256:[a-f0-9]{64}', record.get('image', ''))):
@@ -94,6 +96,11 @@ def read_environment(path):
         if any(c in raw for c in '\x00\r\n'):
             raise ValueError('Unsupported environment value')
         values[key] = raw
+    command = Path(values.get('BUZZ_ACP_AGENT_COMMAND', '')).name
+    if command == 'claude-agent-acp':
+        import claude_profile
+        claude_profile.validate_environment(values)
+        return values
     provider = values.get('BUZZ_AGENT_PROVIDER')
     if provider not in {'openai', 'openrouter'}:
         raise ValueError('Only buzz-agent openai/openrouter provisioning is supported')
@@ -107,7 +114,7 @@ def read_environment(path):
     return values
 
 
-def inspect_base(pilot, image):
+def inspect_base(pilot, image, family='buzz-agent'):
     pilot.image_id(image)
     config = json.loads(pilot.docker(['image', 'inspect', image, '--format', '{{json .Config}}'],
                                     capture_output=True, text=True).stdout)
@@ -118,11 +125,18 @@ def inspect_base(pilot, image):
         'BUZZ_ACP_MCP_COMMAND': '/opt/buzz/bin/buzz-dev-mcp',
         'BUZZ_ACP_BASE_PROMPT_FILE': '/opt/buzz/base-prompt.md',
     }
+    forbidden = set(pilot.FORWARDED)
+    if family == 'claude':
+        import claude_profile
+        expected.update(HOME='/home/paul', BUZZ_ACP_AGENT_COMMAND='/opt/buzz/bin/native-adapter')
+        forbidden.update(claude_profile.HOST_AUTH)
+        if (config.get('Labels') or {}).get('buzz.isolation.native') != 'claude':
+            raise ValueError('Claude provisioning requires the pinned credential-free Claude image')
     if (config.get('Entrypoint') != ['python3', '/opt/buzz/contained.py'] or
             config.get('WorkingDir') != '/workspace' or config.get('Volumes') or
             config.get('Cmd') or
             any(environment.get(key) != value for key, value in expected.items()) or
-            set(environment).intersection(pilot.FORWARDED) or
+            set(environment).intersection(forbidden) or
             (config.get('Labels') or {}).get('buzz.isolation.desktop')):
         raise ValueError('Base must be the pinned common credential-free buzz-agent image')
     user = config.get('User', '')
@@ -130,11 +144,15 @@ def inspect_base(pilot, image):
         raise ValueError('Base image worker identity is unsupported')
 
 
-def service_text(pilot, source, image, declared):
+def service_text(pilot, source, image, declared, family='buzz-agent'):
     script = Path(pilot.__file__).resolve()
     if any(c in str(p) for p in (script, source) for c in ' \t\n\r%"\\'):
         raise ValueError('Unsupported character in unit path')
-    unset = ' '.join(sorted(pilot.FORWARDED - declared))
+    forwarded = pilot.FORWARDED
+    if family == 'claude':
+        import claude_profile
+        forwarded = claude_profile.forwarded(pilot)
+    unset = ' '.join(sorted(forwarded - declared))
     return f'''[Unit]
 Description=Isolated provisioned agent {pilot.AGENT}
 After=network-online.target
@@ -145,7 +163,7 @@ Type=simple
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 EnvironmentFile={source}
 UnsetEnvironment={unset}
-ExecStart=/usr/bin/python3 "{script}" --agent {pilot.AGENT} run --image {image}
+ExecStart=/usr/bin/python3 -E -s "{script}" --agent {pilot.AGENT} run --image {image}
 ExecStop=/usr/bin/docker stop --time 25 {pilot.NAME}
 Restart=on-failure
 RestartSec=15
@@ -178,7 +196,8 @@ def _provision(pilot, agent, env_file, base):
         raise ValueError('Use an absolute non-symlink environment file')
     source = source.resolve(strict=True)
     values = read_environment(source)
-    inspect_base(pilot, base)
+    family = 'claude' if Path(values['BUZZ_ACP_AGENT_COMMAND']).name == 'claude-agent-acp' else 'buzz-agent'
+    inspect_base(pilot, base, family)
     unit_dir = Path.home() / '.config/systemd/user'
     unit = unit_dir / ('buzz-isolated-' + agent + '.service')
     # All allocators use this lock, held through activation/failure recording.
@@ -200,7 +219,9 @@ def _provision(pilot, agent, env_file, base):
         if state not in {'disabled', 'masked', ''}:
             raise ValueError('Existing host service could start on boot')
         volume = 'buzz-isolated-' + agent + '-workspace'
-        for query in [['volume', 'ls', '--filter', 'name=^' + volume + '$', '--format', '{{.Name}}'],
+        volumes = [volume] + (['buzz-isolated-' + agent + '-home'] if family == 'claude' else [])
+        queries = [['volume', 'ls', '--filter', 'name=^' + name + '$', '--format', '{{.Name}}'] for name in volumes]
+        for query in queries + [
                       ['ps', '-aq', '--filter', 'name=^/buzz-isolated-' + agent + '$'],
                       ['ps', '-aq', '--filter', 'name=^/buzz-isolated-' + agent + '-init$']]:
             if pilot.docker(query, capture_output=True, text=True).stdout.strip():
@@ -213,7 +234,7 @@ def _provision(pilot, agent, env_file, base):
         uid = next((number for number in range(UID_START, UID_END + 1) if number not in used), None)
         if uid is None:
             raise ValueError('No unreserved worker UID remains')
-        record = {'agent': agent, 'uid': uid, 'base': base, 'state': 'preparing'}
+        record = {'agent': agent, 'uid': uid, 'base': base, 'state': 'preparing', 'family': family}
         write_record(record_path, record)
         pilot.configure_profile(agent, uid, agent)
         wrote_unit = False
@@ -223,10 +244,18 @@ def _provision(pilot, agent, env_file, base):
             local_base = 'buzz-provision-base:' + base.split(':')[1]
             pilot.docker(['tag', base, local_base], capture_output=True)
             with tempfile.TemporaryDirectory(prefix='buzz-provision-') as context:
+                account = 'native-worker' if family == 'claude' else 'buzz-worker'
+                roots = '/workspace /home/paul' if family == 'claude' else '/workspace'
+                policy = ''
+                if family == 'claude':
+                    import claude_profile
+                    Path(context, 'managed-settings.json').write_text(json.dumps(claude_profile.model_policy(values['BUZZ_ACP_MODEL'])))
+                    policy = ('COPY --chmod=0444 managed-settings.json /etc/claude-code/managed-settings.json\n'
+                              'RUN chmod 0755 /etc/claude-code && chown 0:0 /etc/claude-code /etc/claude-code/managed-settings.json\n')
                 Path(context, 'Dockerfile').write_text(f'''FROM {local_base}
 USER 0:0
-RUN /usr/sbin/groupmod --gid {uid} buzz-worker && /usr/sbin/usermod --uid {uid} --gid {uid} buzz-worker && chown {uid}:{uid} /workspace
-USER {uid}:{uid}
+RUN /usr/sbin/groupmod --gid {uid} {account} && /usr/sbin/usermod --uid {uid} --gid {uid} {account} && chown {uid}:{uid} {roots}
+{policy}USER {uid}:{uid}
 ''')
                 iid = Path(context) / 'image-id'
                 pilot.docker(['build', '--network', 'none', '--iidfile', str(iid), context],
@@ -240,7 +269,8 @@ USER {uid}:{uid}
                                       capture_output=True, text=True).stdout.strip()
             if actual_user != f'{uid}:{uid}':
                 raise ValueError('Derived image has the wrong worker identity')
-            pilot.docker(['volume', 'create', '--label', pilot.LABEL, volume], capture_output=True)
+            for name in volumes:
+                pilot.docker(['volume', 'create', '--label', pilot.LABEL, name], capture_output=True)
             # Docker copies /workspace metadata from this image into a NEW volume.
             # Check actual ownership and emptiness without granting root or a host bind.
             code = ('import os; from pathlib import Path; p=Path("/workspace"); '
@@ -248,12 +278,31 @@ USER {uid}:{uid}
                     'assert not list(p.iterdir()); '
                     'p.joinpath(".write-probe").write_bytes(b"ok"); p.joinpath(".write-probe").unlink()')
             args = pilot.runtime_args(image, name=pilot.NAME + '-init', entrypoint='python3', network='none')
+            if family == 'claude':
+                args = claude_profile.runtime_args(pilot, image, name=pilot.NAME + '-init', entrypoint='python3', network='none')
+                code += ('; h=Path("/home/paul"); '
+                         f'assert h.stat().st_uid=={uid} and not list(h.iterdir()); '
+                         'h.joinpath(".write-probe").write_bytes(b"ok"); h.joinpath(".write-probe").unlink(); '
+                         'import json; policy=Path("/etc/claude-code/managed-settings.json"); '
+                         f'assert json.loads(policy.read_text())=={claude_profile.model_policy(values["BUZZ_ACP_MODEL"])!r}; '
+                         'assert policy.stat().st_uid==0 and not (policy.stat().st_mode & 0o222)')
             pilot.docker([*args, image, '-c', code], capture_output=True, text=True)
             unit_dir.mkdir(parents=True, exist_ok=True)
             with unit.open('x') as stream:
                 wrote_unit = True
                 os.chmod(unit, 0o600)
-                stream.write(service_text(pilot, source, image, set(values)))
+                stream.write(service_text(pilot, source, image, set(values), family))
+            if family == 'claude':
+                record.update(image=image, state='awaiting-login', model=values['BUZZ_ACP_MODEL'],
+                              environment_file=str(source),
+                              environment_sha256=hashlib.sha256(source.read_bytes()).hexdigest())
+                write_record(record_path, record)
+                pilot.systemctl('daemon-reload')
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                print(json.dumps({'agent': agent, 'uid': uid, 'image': image, 'family': family,
+                                  'state': 'awaiting-login', 'service': pilot.NAME + '.service',
+                                  'workflow_verified': False}, sort_keys=True))
+                return
             record.update(image=image, state='ready')
             write_record(record_path, record)
             pilot.systemctl('daemon-reload')

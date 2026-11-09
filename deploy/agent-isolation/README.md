@@ -58,7 +58,50 @@ creation flow. It independently reads the resulting bytes from the private
 volume. Other tests cover reservation collisions, failed starts, incorrect
 image identity/pins and unsafe base configurations.
 
-### Existing pilots
+### New Claude workers with their own login
+
+The fresh provisioner also accepts `BUZZ_ACP_AGENT_COMMAND=claude-agent-acp`,
+`BUZZ_ACP_MODEL=claude-fable-5-2` (or another explicit Claude model ID) and the
+new worker's own Buzz identity/relay settings. Select the reviewed credential-free
+Claude runtime image for `--image`. It creates a fresh per-UID image, private
+workspace and private login-home volume; it imports no host Claude state and
+adds no SSH, desktop, host home, host process or control-socket mount.
+
+Preparation stops at `awaiting-login`. Its unit is installed but never enabled.
+In the owner's own terminal, run the same pinned controller with
+`--agent NAME claude-login`. This runs the official `claude auth login --claudeai`
+in a contained terminal with that worker's private home. URLs/codes stay in the
+owner's terminal: never paste login credentials or codes into Buzz messages.
+The login helper has a 10-minute deadline and its exact container is cleaned up.
+No shared token, host credential file or API-billing fallback is supplied.
+
+Then run `--agent NAME claude-activate`. It checks the pending environment hash,
+requires the CLI to report its own `claude.ai` subscription login, verifies the
+exact requested model through ACP with real MCP/file/Git work, and independently
+reads the resulting bytes/UID/Git blob from a read-only worker. Only then can
+its unit become enabled. Actual Docker authority/mounts are audited before
+success; failures never start a host service and keep private login state for
+operator recovery. A final signed relay task remains required after activation.
+The unique `REPOS/claude-profile-ID` preflight repository is retained for
+independent inspection. It contains only the synthetic 370-newline test artifact;
+the owner can delete that exact repository after verifying the live workflow.
+
+The selected model is pinned in a root-owned, read-only managed policy in the
+per-UID image. Only that model is allowed; availability fallback is empty and
+content-based model switching is disabled. Changing this profile's model needs
+a newly verified profile/image, not an unchecked environment edit. See the
+official [model policy documentation](https://code.claude.com/docs/en/model-config)
+and [fresh-login documentation](https://code.claude.com/docs/en/authentication).
+The new CLI path has no host API/OAuth-token forwarding. Its public outbound
+networking remains the existing container policy; it does not add an egress broker.
+
+UI creation must remain gated until the new controller/image and owner-login
+workflow are deployed and verified. A pending-login result is not a running or
+usable agent. `CLAUDE_NEW_IMAGE` enables the full-package real fresh-home/UID/
+policy/unauthenticated-CLI journey, using synthetic configuration and no real
+credentials. That test does not prove subscription access or Fable generation.
+
+### Migrating existing pilots
 
 The supported pilots are Gemma (UID/GID 61021) and Fizz (UID/GID 61022). Each has
 its own service, container, private named workspace volume,

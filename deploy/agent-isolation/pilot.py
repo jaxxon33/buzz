@@ -185,8 +185,12 @@ Host ag
 def start(image):
     if AGENT not in PROFILES:
         import provision
-        if provision.load_profile(AGENT)['image'] != image:
+        record = provision.load_profile(AGENT)
+        if record['image'] != image:
             raise ValueError('Provisioned image differs from its reserved profile')
+        if record.get('family') == 'claude':
+            import claude_profile
+            return claude_profile.start(sys.modules[__name__], image)
     required = {"BUZZ_PRIVATE_KEY", "BUZZ_RELAY_URL"}
     provider_name = os.environ.get("BUZZ_AGENT_PROVIDER")
     if provider_name == "openai":
@@ -465,7 +469,17 @@ def main():
     p = commands.add_parser("provision")
     p.add_argument("--env-file", required=True)
     p.add_argument("--image", required=True, type=image_id)
+    commands.add_parser('claude-login')
+    commands.add_parser('claude-activate')
     args = parser.parse_args()
+    if args.command in {'claude-login', 'claude-activate'}:
+        import claude_profile
+        controller = sys.modules[__name__]
+        if args.command == 'claude-login':
+            claude_profile.login(controller, args.agent)
+        else:
+            claude_profile.activate(controller, args.agent)
+        return
     if args.command == 'provision':
         import provision
         provision.provision(sys.modules[__name__], args.agent, args.env_file, args.image)
