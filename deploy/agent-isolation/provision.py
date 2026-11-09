@@ -201,7 +201,8 @@ def _provision(pilot, agent, env_file, base):
             raise ValueError('Existing host service could start on boot')
         volume = 'buzz-isolated-' + agent + '-workspace'
         for query in [['volume', 'ls', '--filter', 'name=^' + volume + '$', '--format', '{{.Name}}'],
-                      ['ps', '-aq', '--filter', 'name=^/buzz-isolated-' + agent + '$']]:
+                      ['ps', '-aq', '--filter', 'name=^/buzz-isolated-' + agent + '$'],
+                      ['ps', '-aq', '--filter', 'name=^/buzz-isolated-' + agent + '-init$']]:
             if pilot.docker(query, capture_output=True, text=True).stdout.strip():
                 raise ValueError('Existing container or workspace volume must not be reused')
         used = {uid for uid, _ in pilot.PROFILES.values()}
@@ -270,6 +271,9 @@ USER {uid}:{uid}
             else:
                 raise RuntimeError('Provisioned container did not start')
             pilot.systemctl('is-active', pilot.NAME + '.service')
+            # Startup is committed. Do not report an operation timeout during
+            # the success message after the verified service has started.
+            signal.setitimer(signal.ITIMER_REAL, 0)
         except BaseException as error:
             # Keep reservations/storage for deliberate operator recovery. Never
             # enable buzz-acp@, erase a possibly live volume or retry under host UID.
@@ -278,6 +282,16 @@ USER {uid}:{uid}
                 write_record(record_path, record)
             except Exception as cleanup_error:
                 error.add_note('Recovery record update failed: ' + type(cleanup_error).__name__)
+            # Killing the Docker client does not stop its daemon-side container.
+            # This exact helper name was absent before this reservation.
+            try:
+                helper = pilot.NAME + '-init'
+                pending = pilot.docker(['ps', '-aq', '--filter', 'name=^/' + helper + '$'],
+                                       capture_output=True, text=True, timeout=15)
+                if pending.stdout.strip():
+                    pilot.docker(['rm', '--force', helper], capture_output=True, timeout=15)
+            except Exception as cleanup_error:
+                error.add_note('Init helper cleanup needs operator inspection: ' + type(cleanup_error).__name__)
             if wrote_unit:
                 try:
                     pilot.systemctl('disable', '--now', pilot.NAME + '.service', timeout=30)

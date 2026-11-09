@@ -161,6 +161,35 @@ class Provisioning(unittest.TestCase):
         self.assertEqual(signal.getsignal(signal.SIGALRM), before)
         self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0, 0))
 
+    def test_timed_out_init_removes_only_its_daemon_side_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            stack = self.setup_context(home)
+            running = False
+            removed = []
+
+            def docker(args, **kwargs):
+                nonlocal running
+                if args[0] == 'run':
+                    running = True
+                    raise subprocess.TimeoutExpired('docker', 120)
+                if args[:2] == ['ps', '-aq'] and running:
+                    self.assertIn('name=^/buzz-isolated-new-worker-init$', args)
+                    return subprocess.CompletedProcess(args, 0, stdout='synthetic-helper-id')
+                if args[:2] == ['rm', '--force']:
+                    removed.append(args[-1])
+                    running = False
+                return self.docker(args, **kwargs)
+
+            with mock.patch.object(pilot, 'systemctl', side_effect=self.service), \
+                    mock.patch.object(pilot, 'docker', side_effect=docker):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    provision.provision(pilot, 'new-worker', self.fixture(home), BASE)
+            self.assertEqual(removed, ['buzz-isolated-new-worker-init'])
+            self.assertFalse(running)
+            self.assertEqual(json.loads((provision.ROOT / 'new-worker.json').read_text())['state'], 'failed')
+            stack.close()
+
     def test_collisions_and_native_adapters_refused_before_reservation(self):
         for collision in ['native', 'workspace', 'unit', 'volume', 'host']:
             with self.subTest(collision=collision), tempfile.TemporaryDirectory() as directory:
