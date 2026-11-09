@@ -278,10 +278,12 @@ for line in sys.stdin:
     elif method=='session/new':
         result={'sessionId':'local-session'}
     elif method=='session/prompt':
-        p=Path('REPOS/batched-probe');p.mkdir(parents=True)
+        p=Path('REPOS/batched-probe');p.mkdir(parents=True,exist_ok=True)
         (p/'result.txt').write_text('370\\n')
         subprocess.run(['git','init','-q',str(p)],check=True)
+        if Path('wrong-index').exists():(p/'result.txt').write_text('wrong\\n')
         subprocess.run(['git','-C',str(p),'add','result.txt'],check=True)
+        (p/'result.txt').write_text('370\\n')
         result={'stopReason':'end_turn'}
     else:raise RuntimeError('Unexpected method')
     update={'jsonrpc':'2.0','method':'session/update','params':{'update':{'sessionUpdate':'agent_message_chunk'}}}
@@ -293,3 +295,7 @@ for line in sys.stdin:
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 acp_probe.probe([sys.executable,str(adapter)],str(root),None,2,'batched-probe')
             self.assertIn('"native_model_tools": "passed"',output.getvalue())
+            (root / 'REPOS/batched-probe/result.txt').unlink()
+            (root / 'wrong-index').touch()
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, 'staged Git bytes'):
+                acp_probe.probe([sys.executable,str(adapter)],str(root),None,2,'batched-probe')

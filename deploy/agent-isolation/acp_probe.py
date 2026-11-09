@@ -93,9 +93,13 @@ def probe(command, cwd, model, seconds, label='native-check-20261104', with_mcp=
         print(json.dumps({'native_session_updates': updates, 'stop_reason': result.get('stopReason')}), flush=True)
         if expected.read_text() != '370\n':
             raise RuntimeError('Actual artifact does not match')
+        if expected.stat().st_uid != os.getuid():
+            raise RuntimeError('Actual artifact owner does not match worker')
         staged = subprocess.check_output(['git', '-C', str(expected.parent), 'diff', '--cached', '--name-only'], text=True).strip()
         if staged != 'result.txt':
             raise RuntimeError('Actual Git index does not match')
+        if subprocess.check_output(['git', '-C', str(expected.parent), 'show', ':result.txt']) != b'370\n':
+            raise RuntimeError('Actual staged Git bytes do not match')
         print(json.dumps({'native_model_tools': 'passed', 'uid': os.getuid(),
                           'artifact': '370', 'git_staged': staged,
                           'stop_reason': result.get('stopReason'),
