@@ -161,6 +161,38 @@ class Provisioning(unittest.TestCase):
         self.assertEqual(signal.getsignal(signal.SIGALRM), before)
         self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0, 0))
 
+    def test_failure_disarms_operation_alarm_before_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            stack = self.setup_context(home)
+            original = subprocess.CalledProcessError(17, ['synthetic-enable-error'])
+            write = provision.write_record
+            stopped = []
+
+            def system(*args, **kwargs):
+                if args[0] == 'enable':
+                    signal.setitimer(signal.ITIMER_REAL, 1)
+                    raise original
+                if args[0] == 'disable':
+                    stopped.append(args[-1])
+                return self.service(*args)
+
+            def record(path, value):
+                if value['state'] == 'failed':
+                    self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0, 0),
+                                     'The operation deadline is still armed during recovery')
+                write(path, value)
+
+            with mock.patch.object(pilot, 'systemctl', side_effect=system), \
+                    mock.patch.object(pilot, 'docker', side_effect=self.docker), \
+                    mock.patch.object(provision, 'write_record', side_effect=record):
+                with self.assertRaises(subprocess.CalledProcessError) as caught:
+                    provision.provision(pilot, 'new-worker', self.fixture(home), BASE)
+            self.assertIs(caught.exception, original)
+            self.assertEqual(stopped, ['buzz-isolated-new-worker.service'])
+            self.assertEqual(json.loads((provision.ROOT / 'new-worker.json').read_text())['state'], 'failed')
+            stack.close()
+
     def test_timed_out_init_removes_only_its_daemon_side_helper(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)

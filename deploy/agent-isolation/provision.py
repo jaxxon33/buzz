@@ -275,6 +275,9 @@ USER {uid}:{uid}
             # the success message after the verified service has started.
             signal.setitimer(signal.ITIMER_REAL, 0)
         except BaseException as error:
+            # Recovery has its own short command bounds. An operation alarm
+            # firing between these steps must not skip the remaining cleanup.
+            signal.setitimer(signal.ITIMER_REAL, 0)
             # Keep reservations/storage for deliberate operator recovery. Never
             # enable buzz-acp@, erase a possibly live volume or retry under host UID.
             record['state'] = 'failed'
