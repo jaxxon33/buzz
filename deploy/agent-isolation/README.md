@@ -289,6 +289,30 @@ the harness, and the controller retains its existing published port 8080. Its
 unchanged model must work on the host and in the prepared container before a
 service switch; an advertised model listing is not a generation check.
 
+## Starting an eligible agent whose original service is already stopped
+
+Deep and Nectar can use `pilot.py --agent NAME activate --from-stopped
+--snapshot /path/to/reviewed.json --image sha256:IMAGE --env-file /path/to/existing.env`
+after separate exact-operation approval. This path requires the original
+service inactive, disabled and PID 0, an absent replacement unit/container,
+and an unused prepared private workspace volume. It never starts the old host
+service, including on failure. Other profiles do not accept this mode.
+
+Prepare and test the private workspace before review. The snapshot binds
+`agent`, `image`, `environment_file_sha256`, the original `workspace` digest
+and the tested `private_workspace` digest. Both digests have `sha256` and
+`entries` fields from `workspace.digest`. Startup rechecks these fields and
+the stopped service before writing a unit and again immediately before
+enabling the replacement. Existing private work is never recopied or
+overwritten during startup. Retain the original and any older private volumes.
+
+Use `pilot.py --agent NAME rollback --keep-original-stopped` to return the
+selected agent to its prior off state. This stops/disables the replacement,
+proves it is gone, checks the original remains inactive/disabled/PID 0, and
+retains private work. Ordinary activation/rollback defaults remain unchanged.
+GLM Flash's external virtual-environment links still need a separate saved-state
+portability plan; it is not included in this initial stopped-service mode.
+
 ## Explicit Codex/Sol inner-sandbox policy
 
 The default launch remains unchanged. Only Codex and Sol accept the explicit

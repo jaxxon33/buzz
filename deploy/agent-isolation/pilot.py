@@ -279,10 +279,49 @@ def migrate_workspace(image, source, timeout=900):
             producer.wait(timeout=10)
 
 
-def activate(image, source_env):
+def verify_stopped_snapshot(image, source_env, snapshot):
+    """Bind an explicitly reviewed stopped-agent start to its prepared state."""
+    if AGENT not in {'deep', 'nectar'}:
+        raise ValueError('Stopped-agent startup is prepared only for Deep and Nectar')
+    record = json.loads(Path(snapshot).read_text())
+    if (record.get('agent') != AGENT or record.get('image') != image or
+            record.get('environment_file_sha256') != hashlib.sha256(source_env.read_bytes()).hexdigest()):
+        raise ValueError('Stopped-agent snapshot does not match agent, image or settings')
+    for property_name, expected in [('ActiveState', 'inactive'), ('UnitFileState', 'disabled'), ('MainPID', '0')]:
+        actual = systemctl('show', ORIGINAL_SERVICE, '--property=' + property_name, '--value').stdout.strip()
+        if actual != expected:
+            raise ValueError('Original stopped-agent service changed; leave it untouched')
+    for property_name, expected in [('ActiveState', 'inactive'), ('MainPID', '0')]:
+        actual = systemctl('show', NAME + '.service', '--property=' + property_name, '--value').stdout.strip()
+        if actual != expected:
+            raise ValueError('Stopped-agent replacement already has an active service')
+    if workspace.digest(workspace.validate(WORKSPACE_ROOT / AGENT)) != record.get('workspace'):
+        raise ValueError('Stopped-agent source workspace changed after preparation')
+    for query in [['ps', '-aq', '--filter', 'name=^/' + NAME + '$'],
+                  ['ps', '-q', '--filter', 'volume=' + VOLUME]]:
+        if docker(query, capture_output=True, text=True).stdout.strip():
+            raise ValueError('Stopped-agent container name or prepared workspace is already in use')
+    # Inspect only the existing private volume, without a host mount or network.
+    docker(['volume', 'inspect', VOLUME], stdout=subprocess.DEVNULL)
+    code = Path(workspace.__file__).read_text().split("if __name__ == '__main__':")[0]
+    code += "\nimport json\nvalidate('/workspace')\nprint(json.dumps(digest('/workspace')))\n"
+    result = docker(['run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
+                     '--security-opt', 'no-new-privileges', '--user', f'{UID}:{UID}',
+                     '--pids-limit', '64', '--memory', '256m', '--mount',
+                     f'type=volume,source={VOLUME},target=/workspace,readonly,volume-nocopy',
+                     '--entrypoint', 'python3', image, '-c', code], capture_output=True, text=True)
+    if json.loads(result.stdout) != record.get('private_workspace'):
+        raise ValueError('Prepared stopped-agent workspace changed after review')
+
+
+def activate(image, source_env, from_stopped=False, snapshot=None):
     image_id(image)
     script = Path(__file__).resolve()
     source_env = Path(source_env).resolve(strict=True)
+    if from_stopped != (snapshot is not None):
+        raise ValueError('Stopped-agent startup requires both --from-stopped and --snapshot')
+    if from_stopped:
+        verify_stopped_snapshot(image, source_env, snapshot)
     source_workspace = None
     if AGENT not in {'gemma', 'fizz'}:
         source_workspace = workspace.validate(WORKSPACE_ROOT / AGENT)
@@ -291,14 +330,16 @@ def activate(image, source_env):
         raise ValueError("Unsupported character in unit path")
     unit_dir = Path.home() / ".config/systemd/user"
     unit = unit_dir / (NAME + ".service")
+    if from_stopped and (unit.exists() or unit.is_symlink()):
+        raise ValueError('Preserve and inspect the existing stopped-agent replacement unit')
     if unit.exists():
         if unit.is_symlink() or f"Description=Isolated {DISPLAY_NAME} pilot" not in unit.read_text():
             raise ValueError("Refusing to overwrite an unknown pilot unit")
         if systemctl("show", NAME + ".service", "--property=ActiveState", "--value").stdout.strip() != "inactive":
             raise ValueError("Pilot unit already exists and is not stopped")
     state = systemctl("show", ORIGINAL_SERVICE, "--property=ActiveState", "--value").stdout.strip()
-    if state != "active":
-        raise ValueError(f"Expected the original {DISPLAY_NAME} service to be active before migration")
+    if state != ("inactive" if from_stopped else "active"):
+        raise ValueError(f"Original {DISPLAY_NAME} service does not match the selected startup mode")
     docker(["image", "inspect", image], stdout=subprocess.DEVNULL)
     actual_user = docker(["image", "inspect", image, "--format", "{{.Config.User}}"],
                          capture_output=True, text=True).stdout.strip()
@@ -334,10 +375,13 @@ WantedBy=default.target
     systemctl("daemon-reload")
     # Stop the old identity before the replacement ever connects to the relay.
     try:
-        systemctl("disable", "--now", ORIGINAL_SERVICE)
+        if not from_stopped:
+            systemctl("disable", "--now", ORIGINAL_SERVICE)
         if systemctl("show", ORIGINAL_SERVICE, "--property=MainPID", "--value").stdout.strip() != "0":
             raise RuntimeError(f"Old {DISPLAY_NAME} still has a MainPID; refusing duplicate identity")
-        if source_workspace is not None:
+        if from_stopped:
+            verify_stopped_snapshot(image, source_env, snapshot)
+        elif source_workspace is not None:
             migrate_workspace(image, source_workspace)
         systemctl("enable", "--now", NAME + ".service")
         deadline = time.monotonic() + 30
@@ -359,21 +403,31 @@ WantedBy=default.target
                            capture_output=True, text=True)
         if remaining.stdout.strip():
             raise RuntimeError("Pilot failed but is still running; original kept stopped")
-        systemctl("enable", "--now", ORIGINAL_SERVICE)
+        if not from_stopped:
+            systemctl("enable", "--now", ORIGINAL_SERVICE)
         unit.unlink()
         systemctl("daemon-reload")
         raise
     print("Isolated pilot enabled; original service stopped and disabled")
 
 
-def rollback():
+def rollback(keep_original_stopped=False):
+    if keep_original_stopped and AGENT not in {'deep', 'nectar'}:
+        raise ValueError('Stopped-agent rollback is prepared only for Deep and Nectar')
     systemctl("disable", "--now", NAME + ".service")
     result = docker(["ps", "--filter", "name=^/" + NAME + "$", "--format", "{{.ID}}"],
                     capture_output=True, text=True)
     if result.stdout.strip():
         raise RuntimeError("Pilot container is still running; refusing duplicate identity")
-    systemctl("enable", "--now", ORIGINAL_SERVICE)
-    print(f"Original {DISPLAY_NAME} restored; pilot workspace retained")
+    if keep_original_stopped:
+        for property_name, expected in [('ActiveState', 'inactive'), ('UnitFileState', 'disabled'), ('MainPID', '0')]:
+            actual = systemctl('show', ORIGINAL_SERVICE, '--property=' + property_name, '--value').stdout.strip()
+            if actual != expected:
+                raise ValueError('Replacement stopped; original service changed independently')
+        print(f'{DISPLAY_NAME} returned to stopped state; private workspace retained')
+    else:
+        systemctl("enable", "--now", ORIGINAL_SERVICE)
+        print(f"Original {DISPLAY_NAME} restored; pilot workspace retained")
 
 
 def main():
@@ -391,7 +445,10 @@ def main():
         p.add_argument("--image", required=True, type=image_id)
         if command == "activate":
             p.add_argument("--env-file", required=True)
-    commands.add_parser("rollback")
+            p.add_argument("--from-stopped", action="store_true")
+            p.add_argument("--snapshot")
+    p = commands.add_parser("rollback")
+    p.add_argument("--keep-original-stopped", action="store_true")
     args = parser.parse_args()
     configure(args.agent)
     if args.command == "build":
@@ -399,9 +456,9 @@ def main():
     elif args.command == "run":
         raise SystemExit(start(args.image))
     elif args.command == "activate":
-        activate(args.image, args.env_file)
+        activate(args.image, args.env_file, args.from_stopped, args.snapshot)
     else:
-        rollback()
+        rollback(args.keep_original_stopped)
 
 
 if __name__ == "__main__":

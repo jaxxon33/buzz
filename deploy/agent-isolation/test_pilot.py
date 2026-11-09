@@ -170,6 +170,121 @@ class MigrationJourney(unittest.TestCase):
                     self.assertNotIn(("enable", "--now", pilot.NAME + ".service"), calls)
 
 
+class StoppedMigrationJourney(unittest.TestCase):
+    def fixture(self, directory):
+        original = pilot.AGENT
+        self.addCleanup(pilot.configure, original)
+        pilot.configure('deep')
+        home = Path(directory)
+        (home/'.config/systemd/user').mkdir(parents=True)
+        root = home/'nests'
+        source = root/'deep'
+        source.mkdir(parents=True)
+        (source/'saved.txt').write_text('saved work\n')
+        env_file = home/'agent.env'
+        env_file.write_text('BUZZ_AGENT_MODEL=unchanged-model\n')
+        image = 'sha256:'+'a'*64
+        digest = pilot.workspace.digest(source)
+        record = {'agent':'deep','image':image,'workspace':digest,'private_workspace':digest,
+                  'environment_file_sha256':pilot.hashlib.sha256(env_file.read_bytes()).hexdigest()}
+        snapshot = home/'snapshot.json'
+        snapshot.write_text(json.dumps(record))
+        return home, root, env_file, image, snapshot, record
+
+    def test_stale_stopped_snapshot_refuses_before_service_or_volume_writes(self):
+        for changed in ['agent','image','environment_file_sha256','workspace','private_workspace','original_state']:
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
+                home, root, env_file, image, snapshot, record = self.fixture(directory)
+                if changed != 'original_state':
+                    record[changed] = 'changed'
+                    snapshot.write_text(json.dumps(record))
+                calls = []
+
+                def service(*args):
+                    calls.append(args)
+                    self.assertEqual(args[0], 'show', 'Invalid snapshot changed service state')
+                    values = {'ActiveState':'active' if changed=='original_state' else 'inactive',
+                              'UnitFileState':'disabled','MainPID':'0'}
+                    return subprocess.CompletedProcess(args,0,stdout=values[args[2].split('=',1)[1]]+'\n')
+
+                def docker(args, **kwargs):
+                    self.assertNotEqual(args[:2], ['volume','create'])
+                    if args[0]=='run':
+                        self.assertIn('type=volume,source=buzz-isolated-deep-workspace,target=/workspace,readonly,volume-nocopy',args)
+                        self.assertEqual(args[args.index('--network')+1],'none')
+                        return subprocess.CompletedProcess(args,0,stdout=json.dumps(pilot.workspace.digest(root/'deep')))
+                    return subprocess.CompletedProcess(args,0,stdout='')
+
+                with mock.patch.object(pilot.Path,'home',return_value=home), \
+                     mock.patch.object(pilot,'WORKSPACE_ROOT',root), \
+                     mock.patch.object(pilot,'systemctl',side_effect=service), \
+                     mock.patch.object(pilot,'docker',side_effect=docker):
+                    with self.assertRaises(ValueError):
+                        pilot.activate(image,env_file,from_stopped=True,snapshot=snapshot)
+                self.assertFalse((home/'.config/systemd/user/buzz-isolated-deep.service').exists())
+
+    def test_stopped_start_failure_retains_prepared_work_and_never_starts_host(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home, root, env_file, image, snapshot, record = self.fixture(directory)
+            calls = []
+
+            def service(*args):
+                calls.append(args)
+                if args[0]=='show':
+                    value={'ActiveState':'inactive','UnitFileState':'disabled','MainPID':'0'}[args[2].split('=',1)[1]]
+                    return subprocess.CompletedProcess(args,0,stdout=value+'\n')
+                if args==('enable','--now',pilot.NAME+'.service'):
+                    raise subprocess.CalledProcessError(1,['systemctl'])
+                return subprocess.CompletedProcess(args,0,stdout='')
+
+            def docker(args, **kwargs):
+                value = ''
+                if args[0]=='run':
+                    value=json.dumps(record['private_workspace'])
+                elif '{{.Config.User}}' in args:
+                    value='61025:61025'
+                return subprocess.CompletedProcess(args,0,stdout=value)
+
+            with mock.patch.object(pilot.Path,'home',return_value=home), \
+                 mock.patch.object(pilot,'WORKSPACE_ROOT',root), \
+                 mock.patch.object(pilot,'systemctl',side_effect=service), \
+                 mock.patch.object(pilot,'docker',side_effect=docker), \
+                 mock.patch.object(pilot,'migrate_workspace') as copy:
+                with self.assertRaises(subprocess.CalledProcessError):
+                    pilot.activate(image,env_file,from_stopped=True,snapshot=snapshot)
+                copy.assert_not_called()
+            self.assertNotIn(('enable','--now',pilot.ORIGINAL_SERVICE),calls)
+            self.assertNotIn(('disable','--now',pilot.ORIGINAL_SERVICE),calls)
+            self.assertIn(('disable','--now',pilot.NAME+'.service'),calls)
+            self.assertFalse((home/'.config/systemd/user/buzz-isolated-deep.service').exists())
+            self.assertEqual(pilot.workspace.digest(root/'deep'),record['workspace'])
+
+    def test_stopped_rollback_never_enables_original_and_requires_replacement_gone(self):
+        original=pilot.AGENT
+        self.addCleanup(pilot.configure,original)
+        pilot.configure('deep')
+        for remaining in ['', 'still-running-container']:
+            with self.subTest(remaining=remaining):
+                calls=[]
+
+                def service(*args):
+                    calls.append(args)
+                    value=''
+                    if args[0]=='show':
+                        value={'ActiveState':'inactive','UnitFileState':'disabled','MainPID':'0'}[args[2].split('=',1)[1]]
+                    return subprocess.CompletedProcess(args,0,stdout=value+'\n')
+
+                with mock.patch.object(pilot,'systemctl',side_effect=service), \
+                     mock.patch.object(pilot,'docker',return_value=subprocess.CompletedProcess([],0,stdout=remaining)):
+                    if remaining:
+                        with self.assertRaises(RuntimeError):
+                            pilot.rollback(keep_original_stopped=True)
+                    else:
+                        pilot.rollback(keep_original_stopped=True)
+                self.assertEqual(calls[0],('disable','--now',pilot.NAME+'.service'))
+                self.assertFalse(any(c[0]=='enable' for c in calls))
+
+
 @unittest.skipUnless(os.environ.get("PILOT_IMAGE"), "Set PILOT_IMAGE for real Docker/MCP checks")
 class BoundaryJourney(unittest.TestCase):
     def test_real_tools_and_repo_work_without_host_access(self):
