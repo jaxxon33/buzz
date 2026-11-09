@@ -4,6 +4,7 @@ Reservations survive failures. No error path starts an uncontained host agent.
 The invoking operator/service owns the profile registry and Docker access.
 """
 import fcntl
+from contextlib import contextmanager
 import grp
 import json
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 import pwd
 import re
 import shlex
+import signal
 import stat
 import subprocess
 import tempfile
@@ -37,14 +39,37 @@ def load_profile(agent):
 
 
 def write_record(path, record):
-    temporary = path.with_suffix('.tmp')
-    with temporary.open('x', encoding='utf-8') as stream:
-        os.chmod(temporary, 0o600)
-        json.dump(record, stream, sort_keys=True, indent=2)
-        stream.write('\n')
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    descriptor, filename = tempfile.mkstemp(prefix=path.stem + '.', suffix='.tmp', dir=path.parent)
+    temporary = Path(filename)
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+            json.dump(record, stream, sort_keys=True, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def operation_deadline(seconds=12 * 60):
+    """Leave time for failure recording/stop before the caller's 15min timeout."""
+    def expired(*_):
+        raise TimeoutError('Isolated provisioning exceeded its operation deadline')
+
+    previous_handler = signal.signal(signal.SIGALRM, expired)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def read_environment(path):
@@ -136,6 +161,11 @@ WantedBy=default.target
 
 def provision(pilot, agent, env_file, base):
     """Reserve one identity, create empty private storage and start it contained."""
+    with operation_deadline():
+        return _provision(pilot, agent, env_file, base)
+
+
+def _provision(pilot, agent, env_file, base):
     validate_name(agent)
     # Native profiles are reserved too, without importing their credential code.
     if agent in pilot.PROFILES or agent in {
@@ -240,13 +270,19 @@ USER {uid}:{uid}
             else:
                 raise RuntimeError('Provisioned container did not start')
             pilot.systemctl('is-active', pilot.NAME + '.service')
-        except BaseException:
+        except BaseException as error:
             # Keep reservations/storage for deliberate operator recovery. Never
             # enable buzz-acp@, erase a possibly live volume or retry under host UID.
             record['state'] = 'failed'
-            write_record(record_path, record)
+            try:
+                write_record(record_path, record)
+            except Exception as cleanup_error:
+                error.add_note('Recovery record update failed: ' + type(cleanup_error).__name__)
             if wrote_unit:
-                pilot.systemctl('disable', '--now', pilot.NAME + '.service')
+                try:
+                    pilot.systemctl('disable', '--now', pilot.NAME + '.service', timeout=30)
+                except Exception as cleanup_error:
+                    error.add_note('Replacement stop needs operator inspection: ' + type(cleanup_error).__name__)
             raise
         print(json.dumps({'agent': agent, 'uid': uid, 'image': image, 'volume': volume,
                           'service': pilot.NAME + '.service', 'state': 'started',

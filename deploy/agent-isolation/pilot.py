@@ -253,11 +253,11 @@ def start(image):
         return subprocess.call(["docker", *args, image])
 
 
-def systemctl(*args):
+def systemctl(*args, timeout=120):
     env = dict(os.environ)
     env["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
     env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{os.getuid()}/bus"
-    return run(["systemctl", "--user", *args], env=env, capture_output=True, text=True)
+    return run(["systemctl", "--user", *args], env=env, capture_output=True, text=True, timeout=timeout)
 
 
 def migrate_workspace(image, source, timeout=900):
@@ -488,5 +488,6 @@ if __name__ == "__main__":
         main()
     except (ValueError, OSError, subprocess.SubprocessError, RuntimeError) as error:
         # Do not include subprocess environments or arbitrary provider output.
-        print(f"pilot: {type(error).__name__}: {error}", file=sys.stderr)
+        detail = '; '.join([str(error), *getattr(error, '__notes__', [])])
+        print(f"pilot: {type(error).__name__}: {detail}", file=sys.stderr)
         sys.exit(1)

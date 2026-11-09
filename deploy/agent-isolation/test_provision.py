@@ -2,9 +2,11 @@
 from contextlib import ExitStack
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 import uuid
@@ -37,7 +39,7 @@ class Provisioning(unittest.TestCase):
         source.chmod(0o600)
         return source
 
-    def service(self, *args):
+    def service(self, *args, **kwargs):
         value = ''
         if args[0] == 'show':
             value = {'MainPID': '0', 'ActiveState': 'inactive', 'UnitFileState': 'disabled'}[
@@ -102,7 +104,7 @@ class Provisioning(unittest.TestCase):
                 stack = self.setup_context(home)
                 calls = []
 
-                def system(*args):
+                def system(*args, **kwargs):
                     calls.append(args)
                     if args[0] == failure:
                         raise subprocess.CalledProcessError(1, ['systemctl'])
@@ -125,6 +127,39 @@ class Provisioning(unittest.TestCase):
                 if failure == 'enable':
                     self.assertIn(('disable', '--now', 'buzz-isolated-new-worker.service'), calls)
                 stack.close()
+
+    def test_crash_temp_cannot_block_record_updates_and_cleanup_preserves_first_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            stack = self.setup_context(home)
+            provision.ROOT.mkdir()
+            (provision.ROOT / 'new-worker.tmp').write_text('interrupted old write')
+            original = subprocess.CalledProcessError(17, ['synthetic-enable-error'])
+
+            def system(*args, **kwargs):
+                if args[0] == 'enable':
+                    raise original
+                if args[0] == 'disable':
+                    raise subprocess.CalledProcessError(18, ['synthetic-stop-error'])
+                return self.service(*args)
+
+            with mock.patch.object(pilot, 'systemctl', side_effect=system), \
+                    mock.patch.object(pilot, 'docker', side_effect=self.docker):
+                with self.assertRaises(subprocess.CalledProcessError) as caught:
+                    provision.provision(pilot, 'new-worker', self.fixture(home), BASE)
+            self.assertIs(caught.exception, original)
+            self.assertEqual(json.loads((provision.ROOT / 'new-worker.json').read_text())['state'], 'failed')
+            self.assertIn('Replacement stop needs operator inspection', original.__notes__[0])
+            self.assertEqual((provision.ROOT / 'new-worker.tmp').read_text(), 'interrupted old write')
+            stack.close()
+
+    def test_whole_operation_deadline_restores_process_alarm(self):
+        before = signal.getsignal(signal.SIGALRM)
+        with self.assertRaises(TimeoutError):
+            with provision.operation_deadline(0.01):
+                time.sleep(0.1)
+        self.assertEqual(signal.getsignal(signal.SIGALRM), before)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0, 0))
 
     def test_collisions_and_native_adapters_refused_before_reservation(self):
         for collision in ['native', 'workspace', 'unit', 'volume', 'host']:
@@ -210,6 +245,20 @@ class ProvisionedStorageJourney(unittest.TestCase):
     fixture = Provisioning.fixture
     service = Provisioning.service
     setup_context = Provisioning.setup_context
+
+    def test_real_named_volume_collision_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.setup_context(home)
+            name = 'provision-collision-' + uuid.uuid4().hex[:12]
+            volume = 'buzz-isolated-' + name + '-workspace'
+            pilot.docker(['volume', 'create', volume], capture_output=True)
+            self.addCleanup(subprocess.run, ['docker', 'volume', 'rm', volume],
+                            capture_output=True, timeout=30)
+            with mock.patch.object(pilot, 'systemctl', side_effect=self.service):
+                with self.assertRaisesRegex(ValueError, 'Existing container or workspace volume'):
+                    provision.provision(pilot, name, self.fixture(home, name), os.environ['PILOT_IMAGE'])
+            self.assertFalse((provision.ROOT / (name + '.json')).exists())
 
     def test_real_uid_derivative_and_fresh_private_volume(self):
         # Exercise the production provisioner with Docker, while substituting

@@ -20,6 +20,11 @@ membership, admin role, SSH key or desktop access is created by this command.
 
 The host registry `~/.config/buzz-agent-isolation/profiles/` holds private,
 atomic per-name records. A process lock serializes reservation and activation.
+Record updates use private unique temporary files, so a crashed write cannot
+block later recovery updates. Provisioning has a 12-minute operation deadline;
+failed service cleanup has its own 30-second bound, within Hive's 15-minute
+caller timeout. Cleanup failures are attached to the original error for
+operator inspection; an abrupt kill can still leave a reserved preparing record.
 New worker UIDs/GIDs come from 62000–64999, excluding host accounts/groups and
 all retained reservations. The controller builds a credential-free derivative
 with that worker identity, pins its actual image ID in the service and registry,
