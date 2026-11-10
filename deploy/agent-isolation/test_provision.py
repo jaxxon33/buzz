@@ -29,6 +29,42 @@ def config():
 
 
 class Provisioning(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get('PILOT_SYSTEMD_TEST'), 'Set PILOT_SYSTEMD_TEST for real unit edits')
+    def test_real_systemd_restart_accepts_new_env_key_and_clears_removed_key(self):
+        # No credentials or agent process. Exercise real manager precedence using
+        # the production unit generator, with a synthetic executable payload.
+        name = 'buzz-env-journey-' + uuid.uuid4().hex[:12]
+        unit = Path.home() / '.config/systemd/user' / (name + '.service')
+        keys = {'BUZZ_ISOLATION_TEST_ADDED', 'BUZZ_ISOLATION_TEST_AMBIENT'}
+        def system(*args):
+            return subprocess.run(['systemctl', '--user', *args], check=True,
+                                  capture_output=True, text=True, timeout=30)
+        with tempfile.TemporaryDirectory() as directory:
+            source, output, script = (Path(directory) / item for item in ('test.env', 'result.json', 'probe.py'))
+            source.write_text('')
+            script.write_text('import json,os\nfrom pathlib import Path\n'
+                              f'Path({str(output)!r}).write_text(json.dumps({{k:os.environ.get(k) for k in {sorted(keys)!r}}}))\n')
+            with mock.patch.object(pilot, 'FORWARDED', frozenset(keys)):
+                text = provision.service_text(pilot, source, DERIVED, set())
+            text = '\n'.join(line for line in text.splitlines()
+                             if not line.startswith(('ExecStart=', 'ExecStop=', 'Restart=')))
+            text = text.replace('Type=simple', f'Type=oneshot\nExecStart=/usr/bin/python3 -I {script}')
+            try:
+                system('set-environment', 'BUZZ_ISOLATION_TEST_AMBIENT=must-not-leak')
+                unit.write_text(text + '\n')
+                system('daemon-reload')
+                for content, expected in [('', ''), ('BUZZ_ISOLATION_TEST_ADDED=owner\n', 'owner'), ('', '')]:
+                    source.write_text(content)
+                    system('restart', name)
+                    result = json.loads(output.read_text())
+                    self.assertEqual(result['BUZZ_ISOLATION_TEST_ADDED'], expected)
+                    self.assertEqual(result['BUZZ_ISOLATION_TEST_AMBIENT'], '')
+            finally:
+                system('stop', name)
+                unit.unlink(missing_ok=True)
+                system('daemon-reload')
+                system('unset-environment', 'BUZZ_ISOLATION_TEST_AMBIENT')
+
     def fixture(self, home, name='new-worker'):
         source = home / ('buzz-acp-' + name + '.env')
         source.write_text('BUZZ_PRIVATE_KEY=synthetic-test-only\nBUZZ_RELAY_URL=wss://relay.invalid\n'
@@ -89,7 +125,8 @@ class Provisioning(unittest.TestCase):
                 self.assertIn('type=volume,source=buzz-isolated-' + name + '-workspace,target=/workspace', args)
                 unit = home / '.config/systemd/user' / ('buzz-isolated-' + name + '.service')
                 self.assertIn('run --image ' + DERIVED, unit.read_text())
-                self.assertIn('UnsetEnvironment=', unit.read_text())
+                self.assertNotIn('UnsetEnvironment=', unit.read_text())
+                self.assertIn('BUZZ_ACP_RESPOND_TO_ALLOWLIST=', unit.read_text())
             self.assertNotEqual(provision.load_profile('new-worker')['uid'], provision.load_profile('other-worker')['uid'])
             with self.assertRaises(ValueError):
                 provision.provision(pilot, 'new-worker', home / 'buzz-acp-new-worker.env', BASE)

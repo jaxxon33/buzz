@@ -152,7 +152,8 @@ def service_text(pilot, source, image, declared, family='buzz-agent'):
     if family == 'claude':
         import claude_profile
         forwarded = claude_profile.forwarded(pilot)
-    unset = ' '.join(sorted(forwarded - declared))
+    # Clear ambient values without erasing later EnvironmentFile edits.
+    defaults = ' '.join(key + '=' for key in sorted(forwarded))
     return f'''[Unit]
 Description=Isolated provisioned agent {pilot.AGENT}
 After=network-online.target
@@ -161,8 +162,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment={defaults}
 EnvironmentFile={source}
-UnsetEnvironment={unset}
 ExecStart=/usr/bin/python3 -E -s "{script}" --agent {pilot.AGENT} run --image {image}
 ExecStop=/usr/bin/docker stop --time 25 {pilot.NAME}
 Restart=on-failure

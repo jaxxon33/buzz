@@ -95,7 +95,7 @@ def start(pilot, image):
     bridge = pilot.docker(['network', 'inspect', 'bridge', '--format',
                           '{{(index .IPAM.Config 0).Gateway}}'], capture_output=True, text=True).stdout.strip()
     args += ['--add-host', relay + ':127.0.0.1']
-    for key in sorted(forwarded(pilot).intersection(os.environ)):
+    for key in sorted(key for key in forwarded(pilot) if os.environ.get(key)):
         args += ['--env', key]
     with ExitStack() as cleanup:
         tunnel = cleanup.enter_context(pilot.Tunnel((bridge, 0), (address, 443)))

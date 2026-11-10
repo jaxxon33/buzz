@@ -453,3 +453,12 @@ do not acquire this policy unless explicitly selected at their own restart.
 Max's private workspace volume also appears at its original nest path so saved
 absolute Git worktree links keep working. This mounts the same private volume
 at two paths; it does not mount the original host workspace or host home.
+
+### Messaging edits after provisioning
+
+Generated units clear all forwarded keys with empty Environment defaults; the
+private EnvironmentFile overrides them on every start. Empty defaults are never
+forwarded to a worker. This permits later Hive edits and clears removed settings
+without inheriting another identity from the user manager. Do not freeze a
+creation-time UnsetEnvironment list: it also erases later env-file additions.
+Existing units need these defaults and a controller with empty-value filtering.

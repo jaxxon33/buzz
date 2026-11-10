@@ -23,6 +23,7 @@ class Configuration(unittest.TestCase):
         self.addCleanup(pilot.configure, pilot.AGENT)
         pilot.configure("north")
         environment = {
+            'BUZZ_AUTH_TAG': '', 'BUZZ_ACP_MAX_TURNS_PER_SESSION': '',
             "BUZZ_PRIVATE_KEY": "test-worker-key", "BUZZ_RELAY_URL": "wss://relay.invalid",
             "BUZZ_AGENT_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "test-provider-key",
             "OPENROUTER_MODEL": "unchanged-model",
@@ -47,6 +48,8 @@ class Configuration(unittest.TestCase):
             self.assertIn("relay.invalid:127.0.0.1", args)
             self.assertIn("OPENROUTER_BASE_URL", args)
             self.assertNotIn("test-provider-key", args)
+            self.assertNotIn('BUZZ_AUTH_TAG', args)
+            self.assertNotIn('BUZZ_ACP_MAX_TURNS_PER_SESSION', args)
             self.assertEqual(os.environ["OPENROUTER_BASE_URL"], environment["OPENROUTER_BASE_URL"])
 
     def test_agent_profiles_have_distinct_authority_and_workspaces(self):

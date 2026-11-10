@@ -32,6 +32,25 @@ class ClaudeProfile(unittest.TestCase):
     setup_context = test_provision.Provisioning.setup_context
     service = test_provision.Provisioning.service
 
+    def test_worker_drops_empty_defaults_but_keeps_declared_messaging(self):
+        environment = {'BUZZ_PRIVATE_KEY': 'synthetic', 'BUZZ_RELAY_URL': 'wss://relay.invalid',
+                       'BUZZ_ACP_MODEL': MODEL, 'BUZZ_AUTH_TAG': '',
+                       'BUZZ_ACP_MAX_TURNS_PER_SESSION': '',
+                       'BUZZ_ACP_RESPOND_TO_ALLOWLIST': 'synthetic-owner'}
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(provision, 'load_profile', return_value={
+                    'family': 'claude', 'image': DERIVED, 'model': MODEL}), \
+                mock.patch.object(claude_profile, 'public_routes', return_value=[]), \
+                mock.patch.object(claude_profile.socket, 'getaddrinfo', return_value=[
+                    (2, 1, 6, '', ('127.0.0.1', 443))]), \
+                mock.patch.object(pilot, 'docker', return_value=subprocess.CompletedProcess([], 0, stdout='127.0.0.1')), \
+                mock.patch.object(claude_profile.subprocess, 'call', return_value=0) as launch:
+            self.assertEqual(claude_profile.start(pilot, DERIVED), 0)
+        args = launch.call_args.args[0]
+        self.assertIn('BUZZ_ACP_RESPOND_TO_ALLOWLIST', args)
+        self.assertNotIn('BUZZ_AUTH_TAG', args)
+        self.assertNotIn('BUZZ_ACP_MAX_TURNS_PER_SESSION', args)
+
     def fixture(self, home, name='new-claude'):
         source = home / ('buzz-acp-' + name + '.env')
         source.write_text('BUZZ_PRIVATE_KEY=synthetic-claude-key\nBUZZ_RELAY_URL=wss://relay.invalid\n'

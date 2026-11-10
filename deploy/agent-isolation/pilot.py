@@ -234,7 +234,7 @@ def start(image):
                 family=socket.AF_INET, type=socket.SOCK_STREAM)[0][4][0]
             args += ["--add-host", f"{provider_url.hostname}:{provider_address}"]
     # Pass variable names, never secret values in the process argument list.
-    for key in sorted(FORWARDED.intersection(os.environ)):
+    for key in sorted(key for key in FORWARDED if os.environ.get(key)):
         args += ["--env", key]
     bridge = docker(["network", "inspect", "bridge", "--format",
                      "{{(index .IPAM.Config 0).Gateway}}"], capture_output=True, text=True).stdout.strip()
@@ -363,10 +363,8 @@ def activate(image, source_env, from_stopped=False, snapshot=None):
     if actual_user != f'{UID}:{UID}':
         raise ValueError('Image identity does not match the selected agent profile')
     docker(["volume", "create", "--label", LABEL, VOLUME], capture_output=True)
-    declared = {match.group(1) for line in source_env.read_text().splitlines()
-                if (match := re.match(r'^([A-Z][A-Z0-9_]*)=', line))}
-    # Missing target values must not inherit another identity's manager env.
-    unset = ' '.join(sorted(FORWARDED - declared))
+    # EnvironmentFile overrides defaults, including settings added by Hive later.
+    defaults = ' '.join(key + '=' for key in sorted(FORWARDED))
     unit.write_text(f'''[Unit]
 Description=Isolated {DISPLAY_NAME} pilot (harness and every child tool)
 After=network-online.target
@@ -375,8 +373,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment={defaults}
 EnvironmentFile={source_env}
-UnsetEnvironment={unset}
 ExecStart=/usr/bin/python3 "{script}" --agent {AGENT} run --image {image}
 ExecStop=/usr/bin/docker stop --time 25 {NAME}
 Restart=on-failure
