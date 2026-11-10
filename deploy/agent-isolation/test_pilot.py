@@ -140,7 +140,8 @@ class MigrationJourney(unittest.TestCase):
                     if args == ("daemon-reload",):
                         unit = home / ".config/systemd/user" / (pilot.NAME + ".service")
                         if unit.exists() and shutil.which("systemd-analyze"):
-                            self.assertIn('BUZZ_AUTH_TAG', unit.read_text().split('UnsetEnvironment=',1)[1].splitlines()[0])
+                            self.assertNotIn('UnsetEnvironment=', unit.read_text())
+                            self.assertIn('BUZZ_AUTH_TAG=', unit.read_text())
                             parsed = subprocess.run(["systemd-analyze", "--user", "verify", str(unit)],
                                                     capture_output=True, text=True, timeout=20)
                             self.assertNotIn("path is not absolute", parsed.stderr)
