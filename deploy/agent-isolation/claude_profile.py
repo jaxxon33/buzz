@@ -134,8 +134,10 @@ def helper(pilot, record, name, command, *, network='none', interactive=False, r
                     capture_output=True, text=True).stdout.strip():
         raise ValueError('Existing Claude helper must be inspected before reuse')
     args = runtime_args(pilot, record['image'], name=name, entrypoint=command[0], network=network)
+    if interactive or kwargs.get('input') is not None:
+        args += ['--interactive']
     if interactive:
-        args += ['--interactive', '--tty']
+        args += ['--tty']
     if readonly:
         for index, value in enumerate(args):
             if value.startswith('type=volume,'):
