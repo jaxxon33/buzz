@@ -28,6 +28,7 @@ class Configuration(unittest.TestCase):
             "BUZZ_AGENT_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "test-provider-key",
             "OPENROUTER_MODEL": "unchanged-model",
             "OPENROUTER_BASE_URL": "https://provider.invalid/v1",
+            "BUZZ_ACP_SESSION_POLICY": "thread",
         }
 
         def inspect(args, **kwargs):
@@ -47,6 +48,8 @@ class Configuration(unittest.TestCase):
             self.assertIn("provider.invalid:192.0.2.19", args)
             self.assertIn("relay.invalid:127.0.0.1", args)
             self.assertIn("OPENROUTER_BASE_URL", args)
+            self.assertIn("BUZZ_ACP_SESSION_POLICY", args)
+            self.assertNotIn("thread", args)
             self.assertNotIn("test-provider-key", args)
             self.assertNotIn('BUZZ_AUTH_TAG', args)
             self.assertNotIn('BUZZ_ACP_MAX_TURNS_PER_SESSION', args)
@@ -88,6 +91,7 @@ class Configuration(unittest.TestCase):
             "BUZZ_ACP_LAUNCH_PREFIX", "BUZZ_ACP_AGENT_COMMAND",
             "BUZZ_ACP_MCP_COMMAND", "BUZZ_ACP_BASE_PROMPT_FILE", "HTTP_PROXY",
         }))
+        self.assertIn("BUZZ_ACP_SESSION_POLICY", pilot.FORWARDED)
 
 
 class RelayTransportJourney(unittest.TestCase):

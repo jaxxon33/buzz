@@ -117,6 +117,7 @@ class ClaudeProfile(unittest.TestCase):
             with self.assertRaises(ValueError):
                 provision.read_environment(source)
         self.assertFalse(claude_profile.HOST_AUTH.intersection(claude_profile.forwarded(pilot)))
+        self.assertIn('BUZZ_ACP_SESSION_POLICY', claude_profile.forwarded(pilot))
 
     def test_missing_login_or_failed_model_check_never_enables_service(self):
         for failure in ['auth_status', 'model_check']:

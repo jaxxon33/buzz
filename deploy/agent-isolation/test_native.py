@@ -15,6 +15,9 @@ import pilot
 
 
 class NativeConfiguration(unittest.TestCase):
+    def test_session_policy_rides_the_pilot_allowlist(self):
+        self.assertIn('BUZZ_ACP_SESSION_POLICY', native.FORWARDED)
+
     def test_explicit_policy_is_pinned_to_selected_agents_and_snapshot(self):
         self.addCleanup(native.configure, 'claude-haiku')
         image = 'sha256:' + 'a' * 64
