@@ -16,10 +16,14 @@ changes no protocol, account, provider, plan or live prompt.
 - Encryption uses the installed `age` / `age-keygen` binaries, without shell
   interpolation, a plaintext temporary file, or a password in argv/environment.
   Crypto stdout is captured privately and stderr never propagates to a log.
+  Initialization generates the key before creating directories; empty partial
+  directories/grants are resumable, and an existing identity is never overwritten.
   The official [age usage](https://github.com/FiloSottile/age#usage) documents
   stdin/stdout and native identity encryption; no crypto is implemented here.
-- A short exclusive store lock serializes edits and launch snapshots. A busy
-  store fails explicitly; it does not launch with partial grants. File updates
+- A short exclusive store lock serializes edits and granted launch snapshots,
+  waiting up to five seconds for another writer. Prompts never hold this lock.
+  An ungranted agent with no stale leaf does not acquire it or require an
+  identity; missing age or an interrupted initialization cannot poison its start. File updates
   use private temporary files, rename, and file/directory fsync. `set` encrypts
   first, removes old grants, writes ciphertext, then commits the desired grants.
   An interrupted update can leave an ungranted secret, never a newly changed
@@ -44,16 +48,25 @@ other bind mounts are still refused.
 A per-agent lease spans preparation, launch and cleanup. A second launcher or
 an existing exact-name container blocks reuse. Stale staging is removed before
 the next launch, including after all grants are revoked. A failed decryption
-fails startup, naming only the secret. Normal exit and failed launch remove
-the leaf. As with other launcher resources, an uncatchable host process kill
+fails startup, naming only the secret. Normal exit, failed launch and catchable SIGTERM unwind and remove
+the leaf. As with other launcher resources, an uncatchable SIGKILL
 can leave tmpfs residue: the next launch removes it after proving no container
 remains, or reboot clears it. If a container remains, stop it through the
 owner-approved lifecycle before retrying; never clear a live leaf manually.
 
 This protects against accidental chat/git/workspace/snapshot leakage and
-cross-agent filesystem access. It does **not** protect against the host user,
+direct cross-agent container filesystem access. It does **not** protect against the host user,
 root, a granted agent, or their process-memory access. Tmpfs can be swapped;
 offline swap/host compromise requires separate encrypted-swap/disk policy.
+**Current deployment caveat:** Claude-Fable's review reports that both Fizz and
+Claude-Fable have SSH credentials reaching `ag` as `paul`, and from there `buzz`
+as `paul`. Any agent with that host authority can read the identity and **all**
+credentials, irrespective of grants. Read-only conduct by agreement is not an
+access control. Per-agent mounts isolate workers without such authority; they
+do not revoke an existing SSH route. Paul must explicitly accept that boundary
+or separately restrict those SSH credentials before adding real logins. This
+PR does not change agent SSH authority.
+
 A granted agent can deliberately copy/exfiltrate a credential. Grant only the
 needed account, agent and purpose. Revoke takes effect on the next restart;
 rotate the provider password if the old agent must lose knowledge of it.
@@ -61,7 +74,10 @@ rotate the provider password if the old agent must lose knowledge of it.
 ## Owner terminal workflow
 
 Install the distro's age package on the host (an owner operation, not performed
-by this PR), e.g. `sudo apt install age`. `findmnt` is also required for grants.
+by this PR), e.g. `sudo apt install age`. `findmnt` is also required for grants. Units use
+`PATH=/usr/local/bin:/usr/bin:/bin`: installing age only in `~/.local/bin` is
+insufficient for service launches. Use the distro package or an approved binary
+in `/usr/local/bin`.
 Do not download a tool implicitly on agent startup. All launch modules and
 `hive-secret` must be installed together in the reviewed, root-owned controller
 bundle; the existing immutable controller directories are not edited in place.
@@ -82,7 +98,9 @@ hive-secret rm globird
 `set` hides both default fields, `username` and `password`. Use repeated
 `--field 'account number'` / `--field password` for other fields. Field names
 are printable labels, not values. Nonterminal entry and any failure to disable
-echo are refused. Overwriting and removal require interactive confirmation.
+echo are refused. Prompt input happens outside the registry lock; a concurrent
+edit forces a fresh confirmation rather than overwriting that edit. Overwriting and removal require interactive confirmation.
+A corrupt secret is listed by name as `unreadable` without blocking other entries.
 On overwrite, omitted `--agent` preserves existing grants; supplied agents
 replace them. A new secret with no `--agent` has no grants.
 

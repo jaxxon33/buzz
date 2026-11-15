@@ -12,9 +12,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
+import time
 import warnings
 
 LIMIT = 64 * 1024
@@ -93,16 +95,21 @@ def sync_dir(path):
 
 
 @contextmanager
-def file_lock(path, nonblocking=False):
+def file_lock(path, nonblocking=False, timeout=5):
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
             raise SecretError('Unsafe secrets lock')
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0))
-        except BlockingIOError:
-            raise SecretError('Secrets are already in use by another launcher') from None
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if nonblocking or time.monotonic() >= deadline:
+                    raise SecretError('Secrets lock is busy; retry the operation') from None
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
         yield
     finally:
         os.close(fd)
@@ -158,29 +165,41 @@ class Store:
         self.grants_path = self.root / 'grants.json'
 
     def check_dirs(self):
-        for path in [self.root, self.encrypted, self.state]:
+        for path in [self.root, self.encrypted]:
             private_dir(path)
 
     def init(self):
+        # Generate first: a missing/broken age installation leaves no store.
+        if self.identity.exists() or self.identity.is_symlink():
+            raise SecretError('Identity already exists; refusing to overwrite it')
+        raw = crypto('age-keygen')
         for path in [self.root, self.encrypted, self.state]:
             private_dir(path, create=True)
-        with file_lock(self.root / '.lock', nonblocking=True):
+        with file_lock(self.root / '.lock'):
             if self.identity.exists() or self.identity.is_symlink():
                 raise SecretError('Identity already exists; refusing to overwrite it')
-            if any(self.encrypted.iterdir()) or self.grants_path.exists() or self.grants_path.is_symlink():
+            if any(self.encrypted.iterdir()) or self.grants():
                 raise SecretError('Store already contains data; restore its matching identity')
-            raw = crypto('age-keygen')
+            # Empty grants are harmless without an identity. A crash here is
+            # resumable by init and must never poison unrelated agent starts.
+            self.save_grants({})
             atomic_write(self.identity, raw)
-            atomic_write(self.grants_path, b'{}\n')
 
     @contextmanager
     def locked(self):
         self.check_dirs()
-        with file_lock(self.root / '.lock', nonblocking=True):
-            read_private(self.identity)
+        with file_lock(self.root / '.lock'):
             yield self
 
+    def identity_path(self):
+        private_dir(self.state)
+        read_private(self.identity)
+        return str(self.identity)
+
     def grants(self):
+        if not self.grants_path.exists() and not self.grants_path.is_symlink():
+            return {}
+        private_dir(self.root)
         try:
             value = json.loads(read_private(self.grants_path))
         except (ValueError, UnicodeError):
@@ -208,7 +227,7 @@ class Store:
 
     def decrypt(self, name):
         raw = read_private(self.encrypted / (validate_name(name) + '.age'))
-        value = crypto('age', ['--decrypt', '--identity', str(self.identity)], raw)
+        value = crypto('age', ['--decrypt', '--identity', self.identity_path()], raw)
         fields_document(value)
         return value
 
@@ -224,7 +243,7 @@ class Store:
         wanted = agents if agents is not None else grants.get(name, {}).get('agents', [])
         # Encrypt before any mutation. Revoking old grants first makes every
         # crash prefix fail closed even though ciphertext and grants are files.
-        encrypted = crypto('age', ['--encrypt', '--identity', str(self.identity)], value)
+        encrypted = crypto('age', ['--encrypt', '--identity', self.identity_path()], value)
         grants.pop(name, None)
         self.save_grants(grants)
         atomic_write(self.encrypted / (name + '.age'), encrypted)
@@ -262,9 +281,21 @@ class Store:
         for path in self.encrypted.iterdir():
             if path.name.endswith('.age'):
                 names.add(validate_name(path.stem))
-        return [{'name': name, 'fields': sorted(fields_document(self.decrypt(name))['fields']),
-                 'agents': grants.get(name, {}).get('agents', []),
-                 'updated': grants.get(name, {}).get('updated')} for name in sorted(names)]
+        rows = []
+        for name in sorted(names):
+            row = {'name': name, 'agents': grants.get(name, {}).get('agents', []),
+                   'updated': grants.get(name, {}).get('updated')}
+            try:
+                row['fields'] = sorted(fields_document(self.decrypt(name))['fields'])
+            except (OSError, SecretError):
+                row.update(fields=[], error='unreadable')
+            rows.append(row)
+        return rows
+
+    def revision(self, name):
+        path = self.encrypted / (validate_name(name) + '.age')
+        raw = read_private(path) if path.exists() or path.is_symlink() else None
+        return raw, self.grants().get(name)
 
 
 def runtime_root():
@@ -285,6 +316,18 @@ def container_exists(name):
 
 
 @contextmanager
+def termination_cleanup():
+    """Make catchable service termination unwind the secrets lease/leaf."""
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+@contextmanager
 def delivery(agent, container_name):
     """Yield only a read-only mount; plaintext is never part of Docker args."""
     import provision
@@ -293,17 +336,17 @@ def delivery(agent, container_name):
     candidate = (Path(os.environ.get('XDG_RUNTIME_DIR', '/run/user/' + str(os.getuid()))) /
                  'hive-secrets' / agent)
     stale = candidate.exists() or candidate.is_symlink()
-    configured = store.root.exists() or store.root.is_symlink()
-    if not configured and not stale:
+    names = sorted(name for name, row in store.grants().items() if agent in row['agents'])
+    if not names and not stale:
         yield []
         return
     mount = []
     with ExitStack() as cleanup:
         # A short global lock gives a coherent snapshot. The per-agent lease
         # stays held through launch/exit, while CLI updates remain available.
-        with store.locked() if configured else nullcontext():
-            names = sorted(name for name, row in store.grants().items()
-                           if agent in row['agents']) if configured else []
+        cleanup.enter_context(termination_cleanup())
+        with store.locked() if names else nullcontext():
+            names = sorted(name for name, row in store.grants().items() if agent in row['agents'])
             if names or stale:
                 root = private_dir(runtime_root(), create=True)
                 cleanup.enter_context(file_lock(root / (agent + '.lock'), nonblocking=True))
@@ -374,14 +417,15 @@ def main(argv=None):
         store.init()
         print('Store initialized. Keep the identity separate from encrypted-store backups.')
         return
-    with store.locked():
-        if args.command == 'list':
-            print(json.dumps(store.metadata(), indent=2))
-        elif args.command == 'set':
-            require_terminal()
-            if (store.encrypted / (args.name + '.age')).exists():
-                if input('Overwrite ' + args.name + '? [y/N] ').lower() != 'y':
-                    return
+    if args.command in {'set', 'rm'}:
+        require_terminal()
+        with store.locked():
+            revision = store.revision(args.name)
+        if args.command == 'rm' or revision[0] is not None:
+            verb = 'Remove' if args.command == 'rm' else 'Overwrite'
+            if input(verb + ' ' + args.name + '? [y/N] ').lower() != 'y':
+                return
+        if args.command == 'set':
             fields = args.field or ['username', 'password']
             if len(set(fields)) != len(fields) or not 1 <= len(fields) <= 32:
                 raise SecretError('Choose 1-32 distinct fields')
@@ -391,15 +435,21 @@ def main(argv=None):
                     values = {field: getpass.getpass(field + ': ') for field in fields}
                 except getpass.GetPassWarning:
                     raise SecretError('Cannot disable terminal echo; no secret was accepted') from None
-            store.set(args.name, values, args.agent)
-            print('Secret saved. Grants and updated values take effect at the next agent restart.')
-        elif args.command in {'grant', 'revoke'}:
+        with store.locked():
+            if store.revision(args.name) != revision:
+                raise SecretError('Secret changed during entry; retry and confirm the new state')
+            if args.command == 'set':
+                store.set(args.name, values, args.agent)
+                print('Secret saved. Grants and updated values take effect at the next agent restart.')
+            else:
+                store.remove(args.name)
+                print('Secret removed. Restart affected agents and rotate the password at the provider.')
+        return
+    with store.locked():
+        if args.command == 'list':
+            print(json.dumps(store.metadata(), indent=2))
+        else:
             store.grant(args.name, args.agent, revoke=args.command == 'revoke')
             print('Grant change takes effect at the next agent restart.')
             if args.command == 'revoke':
                 print('Rotate the password at the provider; a running or previously granted agent may retain it.')
-        else:
-            require_terminal()
-            if input('Remove ' + args.name + '? [y/N] ').lower() == 'y':
-                store.remove(args.name)
-                print('Secret removed. Restart affected agents and rotate the password at the provider.')

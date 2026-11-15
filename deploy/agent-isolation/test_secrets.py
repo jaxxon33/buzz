@@ -7,6 +7,9 @@ from pathlib import Path
 import pty
 import select
 import shutil
+import signal
+import threading
+import time
 import subprocess
 import tempfile
 import unittest
@@ -71,6 +74,47 @@ class SecretValidation(unittest.TestCase):
             path.symlink_to(target)
             with self.assertRaises(OSError):
                 secrets.read_private(path)
+
+    def test_failed_or_interrupted_init_does_not_change_ungranted_launches(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(Path, 'home', return_value=Path(directory)):
+            store = secrets.Store()
+            with mock.patch.object(secrets, 'crypto', side_effect=secrets.SecretError('missing age')):
+                with self.assertRaises(secrets.SecretError):
+                    store.init()
+            self.assertFalse(store.root.exists())
+            # Every directory-creation crash prefix, plus grants before identity.
+            for path in [store.root, store.encrypted, store.state]:
+                secrets.private_dir(path, create=True)
+                with secrets.delivery('fizz', 'buzz-isolated-fizz') as args:
+                    self.assertEqual(args, [])
+            store.save_grants({})
+            with secrets.file_lock(store.root / '.lock'):
+                with secrets.delivery('fizz', 'buzz-isolated-fizz') as args:
+                    self.assertEqual(args, [])
+            self.assertFalse(store.identity.exists())
+
+    def test_store_lock_wait_is_bounded_and_can_outlast_a_short_writer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / 'lock'
+            ready = threading.Event()
+
+            def writer():
+                with secrets.file_lock(lock):
+                    ready.set()
+                    time.sleep(0.2)
+
+            worker = threading.Thread(target=writer)
+            worker.start()
+            try:
+                self.assertTrue(ready.wait(2))
+                with self.assertRaises(secrets.SecretError):
+                    with secrets.file_lock(lock, timeout=0.01):
+                        self.fail('Contended lock succeeded before deadline')
+                with secrets.file_lock(lock, timeout=1):
+                    self.assertFalse(worker.is_alive())
+            finally:
+                worker.join(2)
 
     def test_mount_audit_allows_only_exact_readonly_agent_leaf(self):
         with mock.patch.object(secrets, 'runtime_root', return_value=Path('/run/user/1000/hive-secrets')):
@@ -153,6 +197,12 @@ class SecretJourney(unittest.TestCase):
                 with secrets.delivery('fizz', 'buzz-isolated-fizz'):
                     raise RuntimeError('synthetic docker run failure')
             self.assertFalse(leaf.exists())
+            previous = signal.getsignal(signal.SIGTERM)
+            with self.assertRaises(SystemExit):
+                with secrets.delivery('fizz', 'buzz-isolated-fizz'):
+                    signal.raise_signal(signal.SIGTERM)
+            self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
+            self.assertFalse(leaf.exists())
             leaf.mkdir(mode=0o755)
             (leaf / 'old.json').write_text('synthetic stale value')
             with mock.patch.object(secrets, 'container_exists', return_value=True):
@@ -178,6 +228,13 @@ class SecretJourney(unittest.TestCase):
             self.assertNotIn(self.sentinel, str(caught.exception))
             self.assertIn('test-secret', str(caught.exception))
             self.assertFalse((self.runtime / 'hive-secrets/fizz').exists())
+            with self.store.locked():
+                self.store.set('healthy', {'token': 'synthetic-other'}, [])
+                rows = self.store.metadata()
+            self.assertEqual([r['name'] for r in rows], ['healthy', 'test-secret'])
+            self.assertEqual(rows[0]['fields'], ['token'])
+            self.assertEqual(rows[1]['error'], 'unreadable')
+            self.assertNotIn(self.sentinel, str(rows))
             with mock.patch.object(secrets.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='ext4\n')):
                 with self.assertRaises(secrets.SecretError):
                     secrets.runtime_root()
@@ -240,6 +297,37 @@ class SecretJourney(unittest.TestCase):
                         else:
                             claude_profile.start(pilot, IMAGE)
                 self.assertFalse((self.runtime / 'hive-secrets' / agent).exists())
+
+    def test_prompts_release_the_registry_lock_and_recheck_before_commit(self):
+        self.put()
+        concurrent = False
+
+        def hidden_input(label):
+            nonlocal concurrent
+            with self.store.locked():
+                # Even a granted agent can take the same store lock here.
+                if not concurrent:
+                    self.store.grant('test-secret', 'north')
+                    concurrent = True
+            return 'synthetic-entered-value'
+
+        with mock.patch.object(secrets, 'require_terminal'), \
+                mock.patch('builtins.input', return_value='y'), \
+                mock.patch.object(secrets.getpass, 'getpass', side_effect=hidden_input):
+            with self.assertRaisesRegex(secrets.SecretError, 'changed during entry'):
+                secrets.main(['set', 'test-secret'])
+        with self.store.locked():
+            self.assertEqual(json.loads(self.store.decrypt('test-secret'))['fields']['password'], self.sentinel)
+
+        def confirm_remove(label):
+            with self.store.locked():
+                self.assertIn('test-secret', self.store.grants())
+            return 'y'
+
+        with mock.patch.object(secrets, 'require_terminal'), \
+                mock.patch('builtins.input', side_effect=confirm_remove):
+            secrets.main(['rm', 'test-secret'])
+        self.assertFalse((self.store.encrypted / 'test-secret.age').exists())
 
     def test_real_terminal_entry_hides_both_username_and_password(self):
         master, slave = pty.openpty()
