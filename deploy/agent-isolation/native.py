@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 import pilot
 import workspace
+import hive_secrets
 import native_sandbox
 
 CODEX_SANDBOX = False
@@ -96,8 +97,9 @@ def audit(name, prefix=None):
     }
     if pilot.AGENT == 'claude-opus':
         expected.add(('/home/paul/.config/desktop-mcp', prefix + '-desktop', False))
-    actual = {(m['Destination'], m.get('Name'), m['RW']) for m in data['Mounts'] if m['Type'] != 'tmpfs'}
-    if actual != expected or any(m['Type'] not in {'volume', 'tmpfs'} for m in data['Mounts']):
+    mounts = hive_secrets.audit_mounts(data['Mounts'], pilot.AGENT)
+    actual = {(m['Destination'], m.get('Name'), m['RW']) for m in mounts if m['Type'] != 'tmpfs'}
+    if actual != expected or any(m['Type'] not in {'volume', 'tmpfs'} for m in mounts):
         raise ValueError('Unexpected native mount authority')
     print(json.dumps({'native_boundary': 'passed', 'uid': pilot.UID, 'container': name}))
 
@@ -135,6 +137,7 @@ def start(image, volume_prefix=None):
                            '{{(index .IPAM.Config 0).Gateway}}'],
                           capture_output=True, text=True).stdout.strip()
     with ExitStack() as cleanup:
+        args += cleanup.enter_context(hive_secrets.delivery(pilot.AGENT, pilot.NAME))
         tunnel = cleanup.enter_context(pilot.Tunnel((bridge, 0), (address, 443)))
         port = tunnel.start()
         cleanup.callback(tunnel.shutdown)
