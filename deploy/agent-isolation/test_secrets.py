@@ -243,12 +243,10 @@ class SecretJourney(unittest.TestCase):
 
     def test_real_terminal_entry_hides_both_username_and_password(self):
         master, slave = pty.openpty()
-        code = ('import sys; from pathlib import Path; import hive_secrets as s; '
-                's._Store=s.Store; s.Store=lambda: s._store; s._store=s._Store(Path(sys.argv[1])); '
-                's.main(["set","terminal-secret","--agent","fizz"])')
-        proc = subprocess.Popen(['python3', '-c', code, str(self.home)], stdin=slave, stdout=slave,
-                                stderr=slave, start_new_session=True,
-                                env={**os.environ, 'PYTHONPATH': str(Path(__file__).parent)})
+        command = ['python3', str(Path(__file__).with_name('hive-secret')),
+                   'set', 'terminal-secret', '--agent', 'fizz']
+        proc = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave,
+                                start_new_session=True, env={**os.environ, 'HOME': str(self.home)})
         os.close(slave)
         captured = b''
         try:
