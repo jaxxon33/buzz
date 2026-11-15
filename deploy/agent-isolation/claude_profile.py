@@ -14,6 +14,7 @@ import uuid
 from urllib.parse import urlsplit
 
 import provision
+import hive_secrets
 
 CLI = '/opt/buzz/native/claude'
 HOST_AUTH = frozenset({'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
@@ -71,7 +72,7 @@ def audit(pilot, name, image, network='bridge'):
             host['SecurityOpt'] != ['no-new-privileges:true'] or data['AppArmorProfile'] != 'docker-default' or
             host['Memory'] != 4 * 1024 ** 3 or host['NanoCpus'] != 2 * 10 ** 9 or host['PidsLimit'] != 512):
         raise ValueError('Claude launch authority differs from its private worker boundary')
-    mounts = data['Mounts']
+    mounts = hive_secrets.audit_mounts(data['Mounts'], pilot.AGENT)
     actual = {(item['Destination'], item.get('Name'), item['RW']) for item in mounts if item['Type'] != 'tmpfs'}
     expected = {('/workspace', pilot.VOLUME, True), ('/home/paul', pilot.NAME + '-home', True)}
     if actual != expected or any(item['Type'] not in {'volume', 'tmpfs'} for item in mounts):
@@ -98,6 +99,7 @@ def start(pilot, image):
     for key in sorted(key for key in forwarded(pilot) if os.environ.get(key)):
         args += ['--env', key]
     with ExitStack() as cleanup:
+        args += cleanup.enter_context(hive_secrets.delivery(pilot.AGENT, pilot.NAME))
         tunnel = cleanup.enter_context(pilot.Tunnel((bridge, 0), (address, 443)))
         port = tunnel.start()
         cleanup.callback(tunnel.shutdown)
@@ -134,8 +136,10 @@ def helper(pilot, record, name, command, *, network='none', interactive=False, r
                     capture_output=True, text=True).stdout.strip():
         raise ValueError('Existing Claude helper must be inspected before reuse')
     args = runtime_args(pilot, record['image'], name=name, entrypoint=command[0], network=network)
+    if interactive or kwargs.get('input') is not None:
+        args += ['--interactive']
     if interactive:
-        args += ['--interactive', '--tty']
+        args += ['--tty']
     if readonly:
         for index, value in enumerate(args):
             if value.startswith('type=volume,'):

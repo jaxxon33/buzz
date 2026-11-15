@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 from relay_tunnel import Tunnel
 import workspace
+import hive_secrets
 
 NAME = "buzz-isolated-gemma"
 VOLUME = NAME + "-workspace"
@@ -243,6 +244,7 @@ def start(image):
     # This fixed-destination TCP hop is bound only to docker0, never a public IP.
     # A second hop inside the worker retains the original relay URL and TLS name.
     with ExitStack() as cleanup:
+        args += cleanup.enter_context(hive_secrets.delivery(AGENT, NAME))
         tunnel = cleanup.enter_context(Tunnel((bridge, 0), (address, 443)))
         port = tunnel.start()
         cleanup.callback(tunnel.shutdown)

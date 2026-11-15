@@ -275,16 +275,13 @@ class FreshClaudeJourney(unittest.TestCase):
                     f'assert policy["availableModels"]==[{MODEL!r}]; '
                     'assert policy["switchModelsOnFlag"] is False; '
                     'print("fresh_claude_boundary_passed")')
-            args = claude_profile.runtime_args(pilot, record['image'], name=prefix + '-probe',
-                                              entrypoint='python3', network='none')
             try:
-                result = pilot.docker([*args, record['image'], '-c', code], capture_output=True, text=True)
+                result = claude_profile.helper(pilot, record, prefix + '-probe', ['python3', '-'],
+                                              input=code, capture_output=True, text=True, timeout=30)
                 self.assertIn('fresh_claude_boundary_passed', result.stdout)
             except subprocess.CalledProcessError as error:
                 print((error.stderr or '')[-2000:])
                 raise
-            finally:
-                claude_profile.remove_helper(pilot, prefix + '-probe')
             independent = ('from pathlib import Path; import subprocess; p=Path("/workspace/REPOS/probe"); '
                            f'assert p.joinpath("result.txt").stat().st_uid=={record["uid"]}; '
                            'assert p.joinpath("result.txt").read_bytes()==b"370\\n"; '

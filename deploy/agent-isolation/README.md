@@ -6,6 +6,13 @@ wire protocol and does not rely on the launch-prefix hook being supported by
 an older deployed binary. The harness, every worker, MCP server and shell run
 inside the same boundary.
 
+## Host credentials
+
+The optional [host secrets store](SECRETS.md) provides age-encrypted credentials
+and per-agent read-only tmpfs delivery. Its owner-terminal CLI is `hive-secret`;
+no credential is entered through Buzz. Installation and live restarts require
+a separate approved rollout.
+
 ## Scope
 
 ### New VM workers
