@@ -30,6 +30,13 @@ changes no protocol, account, provider, plan or live prompt.
   secret accessible through its old grants. `list` exposes such entries so the
   owner can regrant them or rerun `set`. `rm` also removes grants first.
 
+A damaged or incorrectly permissioned `grants.json` stops **all** agent starts:
+without a valid grant registry the launcher cannot know which agents require
+credentials, so it fails closed. The owner must restore its ownership/mode 0600
+or a verified matching grants backup, then inspect `hive-secret list` before
+retrying the approved lifecycle. Do not replace the identity or initialize over
+existing encrypted credentials to repair a grant registry.
+
 Each live launch (`pilot.start`, `native.start`, fresh `claude_profile.start`)
 uses the shared delivery helper. Login, provisioning probes and model-check
 helpers receive no secrets. Without a store/grant there is no mount or crypto

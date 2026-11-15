@@ -235,6 +235,17 @@ class SecretJourney(unittest.TestCase):
             self.assertEqual(rows[0]['fields'], ['token'])
             self.assertEqual(rows[1]['error'], 'unreadable')
             self.assertNotIn(self.sentinel, str(rows))
+            registry = self.store.grants_path.read_bytes()
+            self.store.grants_path.chmod(0o644)
+            with self.assertRaisesRegex(secrets.SecretError, 'mode 0600'):
+                with secrets.delivery('north', 'buzz-isolated-north'):
+                    self.fail('Untrusted grants were treated as no grants')
+            self.store.grants_path.chmod(0o600)
+            self.store.grants_path.write_bytes(b'corrupt registry')
+            with self.assertRaisesRegex(secrets.SecretError, 'restore a verified grants backup'):
+                with secrets.delivery('north', 'buzz-isolated-north'):
+                    self.fail('Damaged grants were treated as no grants')
+            self.store.grants_path.write_bytes(registry)
             with mock.patch.object(secrets.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='ext4\n')):
                 with self.assertRaises(secrets.SecretError):
                     secrets.runtime_root()

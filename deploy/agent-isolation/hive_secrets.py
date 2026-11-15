@@ -201,9 +201,13 @@ class Store:
             return {}
         private_dir(self.root)
         try:
-            value = json.loads(read_private(self.grants_path))
+            raw = read_private(self.grants_path)
+        except (OSError, SecretError):
+            raise SecretError('Grant registry must be an owned regular file with mode 0600 and size at most 64 KiB') from None
+        try:
+            value = json.loads(raw)
         except (ValueError, UnicodeError):
-            raise SecretError('Invalid secrets grant registry') from None
+            raise SecretError('Invalid secrets grant registry; restore a verified grants backup') from None
         if not isinstance(value, dict) or len(value) > 256:
             raise SecretError('Invalid secrets grant registry')
         for name, row in value.items():
