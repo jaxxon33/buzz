@@ -48,7 +48,9 @@ class LaunchArgs(unittest.TestCase):
 
     def test_real_file_is_mounted_readonly_and_selected(self):
         self.source.mkdir()
+        self.source.chmod(0o755)
         (self.source / 'base-prompt.md').write_text('rules\n')
+        (self.source / 'base-prompt.md').chmod(0o644)
         self.assertEqual(shared_prompt.launch_args(), [
             '--mount', f'type=bind,source={self.source},target=/opt/buzz/shared,readonly',
             '--env', 'BUZZ_ACP_BASE_PROMPT_FILE=/opt/buzz/shared/base-prompt.md'])
@@ -78,8 +80,22 @@ class LaunchArgs(unittest.TestCase):
         def directory_as_file():
             (self.source / 'base-prompt.md').mkdir(parents=True)
 
-        for case in [missing_dir, empty_file, missing_file, symlinked_dir, symlinked_file, directory_as_file]:
+        def unreadable_file():
+            # An atomic save (temp file + rename) commonly leaves mode 0600.
+            self.source.mkdir()
+            (self.source / 'base-prompt.md').write_text('rules\n')
+            (self.source / 'base-prompt.md').chmod(0o600)
+
+        def untraversable_dir():
+            self.source.mkdir()
+            (self.source / 'base-prompt.md').write_text('rules\n')
+            self.source.chmod(0o750)
+
+        for case in [missing_dir, empty_file, missing_file, symlinked_dir, symlinked_file, directory_as_file,
+                     unreadable_file, untraversable_dir]:
             with self.subTest(case=case.__name__):
+                if self.source.is_dir() and not self.source.is_symlink():
+                    self.source.chmod(0o755)
                 subprocess.run(['rm', '-rf', str(self.source)], check=True)
                 case()
                 with mock.patch('sys.stderr') as stderr:

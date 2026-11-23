@@ -16,12 +16,18 @@ FILE = 'base-prompt.md'
 def launch_args():
     """Return the mount and prompt path, or nothing (baked prompt) when unusable."""
     try:
-        if not stat.S_ISDIR(os.lstat(SOURCE).st_mode):
+        directory = os.lstat(SOURCE).st_mode
+        if not stat.S_ISDIR(directory):
             raise OSError('source is not a real directory')
+        # Workers run as their own UID, so only the "other" bits grant access.
+        if directory & (stat.S_IROTH | stat.S_IXOTH) != stat.S_IROTH | stat.S_IXOTH:
+            raise OSError('source directory is not readable by worker UIDs')
         # A symlink would dangle inside the container; require the real file.
         info = os.lstat(SOURCE / FILE)
         if not stat.S_ISREG(info.st_mode) or info.st_size == 0:
             raise OSError('prompt is not a non-empty regular file')
+        if not info.st_mode & stat.S_IROTH:
+            raise OSError('prompt is not readable by worker UIDs')
     except OSError as error:
         print(f'warning: shared prompt unavailable ({error}); using the baked prompt',
               file=sys.stderr)
