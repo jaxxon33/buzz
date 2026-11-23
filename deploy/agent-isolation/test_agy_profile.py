@@ -216,7 +216,7 @@ class AgyProfile(unittest.TestCase):
                     mock.patch.object(pilot, 'docker', side_effect=self.docker), \
                     mock.patch.object(agy_profile, 'auth_status', side_effect=lambda *_: steps.append('auth')), \
                     mock.patch.object(agy_profile, 'model_check', side_effect=lambda *_: steps.append('model')), \
-                    mock.patch.object(agy_profile, 'audit', side_effect=lambda *_: steps.append('audit')):
+                    mock.patch.object(agy_profile, 'audit', side_effect=lambda *_, **__: steps.append('audit')):
                 agy_profile.activate(pilot, 'new-agy')
             self.assertEqual(steps, ['auth', 'model', 'enable', 'audit', 'is-active'])
             self.assertEqual(provision.load_profile('new-agy')['family'], 'agy')
@@ -319,6 +319,133 @@ class AgyProfile(unittest.TestCase):
             self.assertEqual(files, ['Dockerfile', 'base-prompt.md', 'bin/buzz', 'bin/buzz-acp', 'bin/buzz-dev-mcp',
                                      'bin/native-adapter', 'contained.py', 'manifest.json', 'relay_tunnel.py',
                                      'runtime/agy'])
+
+    def ssh_home(self, home, display='Neon'):
+        agents = home / '.ssh/agents'
+        agents.mkdir(parents=True)
+        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'buzz-agent:' + display,
+                        '-f', str(agents / display)], check=True)
+        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(home / 'hostkey')], check=True)
+        host = (home / 'hostkey.pub').read_text().split()
+        other = '10.0.0.9 ' + ' '.join(host[:2])
+        (home / '.ssh/known_hosts').write_text(other + '\n100.109.21.86 ' + ' '.join(host[:2]) + '\n')
+        return agents / display
+
+    def ready(self, home):
+        source = self.fixture(home)
+        source.write_text(source.read_text() + 'BUZZ_ACP_DISPLAY_NAME=Neon\n')
+        with mock.patch.object(pilot, 'systemctl', side_effect=self.service), \
+                mock.patch.object(pilot, 'docker', side_effect=self.docker):
+            provision.provision(pilot, 'new-agy', source, BASE)
+        path = provision.ROOT / 'new-agy.json'
+        record = json.loads(path.read_text())
+        record['state'] = 'ready'
+        provision.write_record(path, record)
+        return record
+
+    def test_ssh_is_off_until_granted_and_then_read_only_for_ag(self):
+        record = {'family': 'agy'}
+        self.assertFalse(agy_profile.ssh_granted(record))
+        self.assertTrue(agy_profile.ssh_granted({'ssh': ['ag']}))
+        for hosts in [['ag', 'm4'], ['m4'], [], 'ag']:
+            with self.subTest(hosts=hosts), self.assertRaisesRegex(ValueError, 'unapproved'):
+                agy_profile.ssh_granted({'ssh': hosts})
+        self.addCleanup(pilot.configure_profile, pilot.AGENT, pilot.UID, pilot.DISPLAY_NAME)
+        pilot.configure_profile('new-agy', 62000, 'new-agy')
+        mounts = [a for a in agy_profile.runtime_args(pilot, DERIVED, ssh=True) if a.startswith('type=volume,')]
+        self.assertEqual(mounts[-1], 'type=volume,source=buzz-isolated-new-agy-ssh,'
+                                     'target=/home/paul/.ssh,readonly,volume-nocopy')
+        self.assertNotIn('-ssh', str(agy_profile.runtime_args(pilot, DERIVED)))
+
+    def test_audit_requires_ssh_mount_to_match_the_grant(self):
+        self.addCleanup(pilot.configure_profile, pilot.AGENT, pilot.UID, pilot.DISPLAY_NAME)
+        pilot.configure_profile('new-agy', 62000, 'new-agy')
+        base = [{'Type': 'volume', 'Destination': '/workspace', 'Name': pilot.VOLUME, 'RW': True},
+                {'Type': 'volume', 'Destination': '/home/paul', 'Name': pilot.NAME + '-home', 'RW': True}]
+        ssh = {'Type': 'volume', 'Destination': '/home/paul/.ssh', 'Name': pilot.NAME + '-ssh', 'RW': False}
+
+        def inspect(mounts):
+            data = {'Image': DERIVED, 'Config': {'User': '62000:62000', 'Env': []}, 'AppArmorProfile': 'docker-default',
+                    'Mounts': mounts, 'HostConfig': {
+                        'NetworkMode': 'bridge', 'PidMode': '', 'IpcMode': 'private', 'Privileged': False,
+                        'ReadonlyRootfs': True, 'CapAdd': None, 'CapDrop': ['ALL'],
+                        'SecurityOpt': ['no-new-privileges:true'], 'Memory': 4 * 1024 ** 3,
+                        'NanoCpus': 2 * 10 ** 9, 'PidsLimit': 512}}
+            return mock.patch.object(pilot, 'docker', return_value=subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps([data])))
+
+        with inspect(base):
+            agy_profile.audit(pilot, pilot.NAME, DERIVED)
+            with self.assertRaisesRegex(ValueError, 'granted SSH'):
+                agy_profile.audit(pilot, pilot.NAME, DERIVED, ssh=True)
+        with inspect(base + [ssh]):
+            agy_profile.audit(pilot, pilot.NAME, DERIVED, ssh=True)
+            with self.assertRaisesRegex(ValueError, 'granted SSH'):
+                agy_profile.audit(pilot, pilot.NAME, DERIVED)
+        with inspect(base + [dict(ssh, RW=True)]):
+            with self.assertRaisesRegex(ValueError, 'granted SSH'):
+                agy_profile.audit(pilot, pilot.NAME, DERIVED, ssh=True)
+
+    def test_grant_copies_only_own_key_and_ag_pin_then_restarts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.setup_context(home)
+            self.ready(home)
+            key = self.ssh_home(home)
+            copied = {}
+
+            def migrate(image, source):
+                copied['volume'] = pilot.VOLUME
+                copied['files'] = {p.name: (p.read_bytes(), p.stat().st_mode & 0o777) for p in Path(source).iterdir()}
+
+            with mock.patch.object(pilot, 'systemctl', side_effect=self.service) as service, \
+                    mock.patch.object(pilot, 'docker', side_effect=self.docker) as docker, \
+                    mock.patch.object(pilot, 'migrate_workspace', side_effect=migrate):
+                agy_profile.ssh_grant(pilot, 'new-agy', home=home)
+            self.assertEqual(copied['volume'], 'buzz-isolated-new-agy-ssh')
+            self.assertEqual(pilot.VOLUME, 'buzz-isolated-new-agy-workspace')
+            files = copied['files']
+            self.assertEqual(sorted(files), ['config', 'id_ed25519', 'known_hosts'])
+            self.assertEqual(files['id_ed25519'], (key.read_bytes(), 0o400))
+            pins = files['known_hosts'][0].decode().splitlines()
+            self.assertEqual(len(pins), 1)
+            self.assertTrue(pins[0].startswith('100.109.21.86 ssh-ed25519 '))
+            config = files['config'][0].decode()
+            self.assertIn('StrictHostKeyChecking yes', config)
+            self.assertNotIn('m4', config)
+            self.assertIn(['volume', 'create', '--label', pilot.LABEL, 'buzz-isolated-new-agy-ssh'],
+                          [c.args[0] for c in docker.call_args_list])
+            self.assertIn(('restart', 'buzz-isolated-new-agy.service'), [c.args for c in service.call_args_list])
+            self.assertEqual(provision.load_profile('new-agy')['ssh'], ['ag'])
+
+    def test_grant_refuses_pending_missing_key_or_display_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.setup_context(home)
+            self.prepare(home)
+            with self.assertRaises(ValueError):
+                agy_profile.ssh_grant(pilot, 'new-agy', home=home)
+        for damage in ['no-key', 'open-key', 'no-display']:
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                stack = self.setup_context(home)
+                self.ready(home)
+                key = self.ssh_home(home)
+                if damage == 'no-key':
+                    key.unlink()
+                elif damage == 'open-key':
+                    key.chmod(0o644)
+                else:
+                    source = home / 'buzz-acp-new-agy.env'
+                    source.write_text(source.read_text().replace('BUZZ_ACP_DISPLAY_NAME=Neon\n', ''))
+                with mock.patch.object(pilot, 'systemctl', side_effect=self.service) as service, \
+                        mock.patch.object(pilot, 'migrate_workspace') as migrate:
+                    with self.assertRaises(ValueError):
+                        agy_profile.ssh_grant(pilot, 'new-agy', home=home)
+                migrate.assert_not_called()
+                service.assert_not_called()
+                self.assertNotIn('ssh', provision.load_profile('new-agy'))
+                stack.close()
 
 
 @unittest.skipUnless(os.environ.get('AGY_NEW_IMAGE'), 'Set AGY_NEW_IMAGE for clean agy storage/login journey')

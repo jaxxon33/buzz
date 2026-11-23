@@ -1,4 +1,7 @@
-"""Fresh Antigravity (agy) workers: private Google login, no host auth, keyring or SSH.
+"""Fresh Antigravity (agy) workers: private Google login, no host auth or keyring.
+
+SSH is off by default. An owner-approved `agy-ssh-grant` gives one ready worker
+its own per-agent key for ag only, in a separate volume mounted read-only.
 
 Mirrors claude_profile: provisioning stops at awaiting-login, the owner signs
 in from their own terminal inside the worker boundary, and only a verified
@@ -11,9 +14,11 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 import uuid
 from urllib.parse import urlsplit
@@ -34,6 +39,24 @@ HOST_AUTH = frozenset({
     'BUZZ_AGENT_PROVIDER', 'OPENROUTER_API_KEY', 'OPENROUTER_MODEL',
     'OPENAI_COMPAT_API_KEY', 'OPENAI_COMPAT_BASE_URL', 'OPENAI_COMPAT_MODEL',
     'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR'})
+# The only host an agy worker may be granted, with its pinned Tailscale address.
+SSH_HOSTS = {'ag': '100.109.21.86'}
+SSH_CONFIG = """Host *
+    User paul
+    IdentityFile /home/paul/.ssh/id_ed25519
+    IdentityAgent none
+    IdentitiesOnly yes
+    BatchMode yes
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    ForwardAgent no
+    ClearAllForwardings yes
+    StrictHostKeyChecking yes
+    UserKnownHostsFile /home/paul/.ssh/known_hosts
+    GlobalKnownHostsFile /dev/null
+Host ag
+    HostName 100.109.21.86
+"""
 MODEL = re.compile(r'gemini-[a-z0-9]+(?:[-.][a-z0-9]+){1,15}')
 
 
@@ -54,16 +77,28 @@ def forwarded(pilot):
                          'BUZZ_PRIVATE_KEY', 'BUZZ_AUTH_TAG', 'BUZZ_RELAY_URL'}) | {'BUZZ_ACP_MODEL'}
 
 
-def runtime_args(pilot, image, name=None, entrypoint=None, network='bridge'):
+def ssh_granted(record):
+    hosts = record.get('ssh')
+    if hosts is None:
+        return False
+    if hosts != sorted(SSH_HOSTS):
+        raise ValueError('agy profile names an unapproved SSH grant')
+    return True
+
+
+def runtime_args(pilot, image, name=None, entrypoint=None, network='bridge', ssh=False):
     args = pilot.runtime_args(image, name=name, entrypoint=entrypoint, network=network)
     args[args.index('--memory') + 1] = '4g'
     args[args.index('--pids-limit') + 1] = '512'
     # No D-Bus/keyring is reachable, so agy keeps its login in the private home.
     args += ['--mount', f'type=volume,source={pilot.NAME}-home,target=/home/paul']
+    if ssh:
+        # Only the running worker gets it; login/check helpers never do.
+        args += ['--mount', f'type=volume,source={pilot.NAME}-ssh,target=/home/paul/.ssh,readonly,volume-nocopy']
     return args
 
 
-def audit(pilot, name, image, network='bridge'):
+def audit(pilot, name, image, network='bridge', ssh=False):
     """Reject unexpected launch authority without printing secret environment."""
     data = json.loads(pilot.docker(['inspect', name], capture_output=True, text=True).stdout)[0]
     host = data['HostConfig']
@@ -76,8 +111,10 @@ def audit(pilot, name, image, network='bridge'):
     mounts = hive_secrets.audit_mounts(data['Mounts'], pilot.AGENT)
     actual = {(item['Destination'], item.get('Name'), item['RW']) for item in mounts if item['Type'] != 'tmpfs'}
     expected = {('/workspace', pilot.VOLUME, True), ('/home/paul', pilot.NAME + '-home', True)}
+    if ssh:
+        expected.add(('/home/paul/.ssh', pilot.NAME + '-ssh', False))
     if actual != expected or any(item['Type'] not in {'volume', 'tmpfs'} for item in mounts):
-        raise ValueError('agy must have only its private workspace and private login home')
+        raise ValueError('agy must have only its private workspace, login home and granted SSH')
     environment = {item.split('=', 1)[0] for item in data['Config'].get('Env') or []}
     if environment.intersection(HOST_AUTH):
         raise ValueError('agy launch carries host or API authentication')
@@ -90,7 +127,7 @@ def start(pilot, image):
         raise ValueError('agy runtime image/model differs from its verified profile')
     if not os.environ.get('BUZZ_PRIVATE_KEY') or not os.environ.get('BUZZ_RELAY_URL'):
         raise ValueError('agy requires its own Buzz environment')
-    args = runtime_args(pilot, image)
+    args = runtime_args(pilot, image, ssh=ssh_granted(record))
     relay = urlsplit(os.environ['BUZZ_RELAY_URL']).hostname
     if not relay:
         raise ValueError('Missing relay hostname')
@@ -266,7 +303,7 @@ def activate(pilot, agent):
                 except subprocess.CalledProcessError:
                     running = ''
                 if running == 'true':
-                    audit(pilot, pilot.NAME, record['image'])
+                    audit(pilot, pilot.NAME, record['image'], ssh=ssh_granted(record))
                     pilot.systemctl('is-active', pilot.NAME + '.service')
                     signal.setitimer(signal.ITIMER_REAL, 0)
                     print(json.dumps({'agent': agent, 'state': 'started', 'family': FAMILY,
@@ -287,3 +324,52 @@ def activate(pilot, agent):
             except Exception as cleanup:
                 error.add_note('agy stop needs inspection: ' + type(cleanup).__name__)
             raise
+
+
+def ssh_grant(pilot, agent, home=Path('/home/paul')):
+    """Owner-approved: copy this agent's own key and the ag pin into its SSH volume."""
+    provision.validate_name(agent)
+    with (provision.ROOT / '.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = provision.ROOT / (agent + '.json')
+        record = provision.load_profile(agent)
+        if record.get('family') != FAMILY:
+            raise ValueError('agy-ssh-grant is only for a ready agy profile')
+        # Hive edits a ready agent's settings (e.g. messaging) in place, so
+        # only the current display name matters here; it selects the key.
+        display = provision.read_environment(Path(record['environment_file'])).get('BUZZ_ACP_DISPLAY_NAME', '')
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}', display):
+            raise ValueError('agy profile has no usable display name for its key')
+        pilot.configure_profile(agent, record['uid'], display)
+        key = home / '.ssh/agents' / display
+        info = key.lstat() if key.exists() or key.is_symlink() else None
+        if info is None or not key.is_file() or key.is_symlink() or info.st_mode & 0o077:
+            raise ValueError('Per-agent key is missing or not a private regular file')
+        if not (home / '.ssh/agents' / (display + '.pub')).is_file():
+            raise ValueError('Per-agent public key is missing')
+        pins = subprocess.run(['ssh-keygen', '-F', SSH_HOSTS['ag'], '-f', str(home / '.ssh/known_hosts')],
+                              capture_output=True, text=True, check=True).stdout
+        pins = [line for line in pins.splitlines() if line and not line.startswith('#')]
+        if len(pins) != 1 or pins[0].split()[1] != 'ssh-ed25519':
+            raise ValueError('Expected exactly one ed25519 host pin for ag')
+        with tempfile.TemporaryDirectory(prefix='buzz-agy-ssh-') as directory:
+            staged = Path(directory) / 'ssh'
+            staged.mkdir(mode=0o700)
+            shutil.copyfile(key, staged / 'id_ed25519')
+            (staged / 'id_ed25519').chmod(0o400)
+            (staged / 'known_hosts').write_text(pins[0] + '\n')
+            (staged / 'config').write_text(SSH_CONFIG)
+            for name in ['known_hosts', 'config']:
+                (staged / name).chmod(0o444)
+            volume = pilot.NAME + '-ssh'
+            pilot.docker(['volume', 'create', '--label', pilot.LABEL, volume], capture_output=True)
+            previous = pilot.VOLUME
+            try:
+                pilot.VOLUME = volume
+                pilot.migrate_workspace(record['image'], staged)
+            finally:
+                pilot.VOLUME = previous
+        record['ssh'] = sorted(SSH_HOSTS)
+        provision.write_record(path, record)
+    pilot.systemctl('restart', pilot.NAME + '.service')
+    print(json.dumps({'agent': agent, 'ssh': record['ssh'], 'restarted': True}))
