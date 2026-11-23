@@ -32,7 +32,7 @@ def load_profile(agent, states=('ready',)):
     validate_name(agent)
     record = json.loads((ROOT / (agent + '.json')).read_text())
     if (record.get('agent') != agent or record.get('state') not in states or
-            record.get('family', 'buzz-agent') not in {'buzz-agent', 'claude'} or
+            record.get('family', 'buzz-agent') not in {'buzz-agent', 'claude', 'agy'} or
             type(record.get('uid')) is not int or
             not UID_START <= record['uid'] <= UID_END or
             not re.fullmatch(r'sha256:[a-f0-9]{64}', record.get('image', ''))):
@@ -101,6 +101,10 @@ def read_environment(path):
         import claude_profile
         claude_profile.validate_environment(values)
         return values
+    if command == 'agy':
+        import agy_profile
+        agy_profile.validate_environment(values)
+        return values
     provider = values.get('BUZZ_AGENT_PROVIDER')
     if provider not in {'openai', 'openrouter'}:
         raise ValueError('Only buzz-agent openai/openrouter provisioning is supported')
@@ -132,6 +136,12 @@ def inspect_base(pilot, image, family='buzz-agent'):
         forbidden.update(claude_profile.HOST_AUTH)
         if (config.get('Labels') or {}).get('buzz.isolation.native') != 'claude':
             raise ValueError('Claude provisioning requires the pinned credential-free Claude image')
+    elif family == 'agy':
+        import agy_profile
+        expected.update(HOME='/home/paul', BUZZ_ACP_AGENT_COMMAND='/opt/buzz/bin/native-adapter')
+        forbidden.update(agy_profile.HOST_AUTH)
+        if (config.get('Labels') or {}).get('buzz.isolation.native') != 'agy':
+            raise ValueError('agy provisioning requires the pinned credential-free agy image')
     if (config.get('Entrypoint') != ['python3', '/opt/buzz/contained.py'] or
             config.get('WorkingDir') != '/workspace' or config.get('Volumes') or
             config.get('Cmd') or
@@ -152,6 +162,9 @@ def service_text(pilot, source, image, declared, family='buzz-agent'):
     if family == 'claude':
         import claude_profile
         forwarded = claude_profile.forwarded(pilot)
+    elif family == 'agy':
+        import agy_profile
+        forwarded = agy_profile.forwarded(pilot)
     # Clear ambient values without erasing later EnvironmentFile edits.
     defaults = ' '.join(key + '=' for key in sorted(forwarded))
     return f'''[Unit]
@@ -197,7 +210,9 @@ def _provision(pilot, agent, env_file, base):
         raise ValueError('Use an absolute non-symlink environment file')
     source = source.resolve(strict=True)
     values = read_environment(source)
-    family = 'claude' if Path(values['BUZZ_ACP_AGENT_COMMAND']).name == 'claude-agent-acp' else 'buzz-agent'
+    family = {'claude-agent-acp': 'claude', 'agy': 'agy'}.get(
+        Path(values['BUZZ_ACP_AGENT_COMMAND']).name, 'buzz-agent')
+    private_home = family in {'claude', 'agy'}
     inspect_base(pilot, base, family)
     unit_dir = Path.home() / '.config/systemd/user'
     unit = unit_dir / ('buzz-isolated-' + agent + '.service')
@@ -220,7 +235,7 @@ def _provision(pilot, agent, env_file, base):
         if state not in {'disabled', 'masked', ''}:
             raise ValueError('Existing host service could start on boot')
         volume = 'buzz-isolated-' + agent + '-workspace'
-        volumes = [volume] + (['buzz-isolated-' + agent + '-home'] if family == 'claude' else [])
+        volumes = [volume] + (['buzz-isolated-' + agent + '-home'] if private_home else [])
         queries = [['volume', 'ls', '--filter', 'name=^' + name + '$', '--format', '{{.Name}}'] for name in volumes]
         for query in queries + [
                       ['ps', '-aq', '--filter', 'name=^/buzz-isolated-' + agent + '$'],
@@ -245,8 +260,8 @@ def _provision(pilot, agent, env_file, base):
             local_base = 'buzz-provision-base:' + base.split(':')[1]
             pilot.docker(['tag', base, local_base], capture_output=True)
             with tempfile.TemporaryDirectory(prefix='buzz-provision-') as context:
-                account = 'native-worker' if family == 'claude' else 'buzz-worker'
-                roots = '/workspace /home/paul' if family == 'claude' else '/workspace'
+                account = 'native-worker' if private_home else 'buzz-worker'
+                roots = '/workspace /home/paul' if private_home else '/workspace'
                 policy = ''
                 if family == 'claude':
                     import claude_profile
@@ -279,6 +294,12 @@ RUN /usr/sbin/groupmod --gid {uid} {account} && /usr/sbin/usermod --uid {uid} --
                     'assert not list(p.iterdir()); '
                     'p.joinpath(".write-probe").write_bytes(b"ok"); p.joinpath(".write-probe").unlink()')
             args = pilot.runtime_args(image, name=pilot.NAME + '-init', entrypoint='python3', network='none')
+            if family == 'agy':
+                import agy_profile
+                args = agy_profile.runtime_args(pilot, image, name=pilot.NAME + '-init', entrypoint='python3', network='none')
+                code += ('; h=Path("/home/paul"); '
+                         f'assert h.stat().st_uid=={uid} and not list(h.iterdir()); '
+                         'h.joinpath(".write-probe").write_bytes(b"ok"); h.joinpath(".write-probe").unlink()')
             if family == 'claude':
                 args = claude_profile.runtime_args(pilot, image, name=pilot.NAME + '-init', entrypoint='python3', network='none')
                 code += ('; h=Path("/home/paul"); '
@@ -293,7 +314,7 @@ RUN /usr/sbin/groupmod --gid {uid} {account} && /usr/sbin/usermod --uid {uid} --
                 wrote_unit = True
                 os.chmod(unit, 0o600)
                 stream.write(service_text(pilot, source, image, set(values), family))
-            if family == 'claude':
+            if private_home:
                 record.update(image=image, state='awaiting-login', model=values['BUZZ_ACP_MODEL'],
                               environment_file=str(source),
                               environment_sha256=hashlib.sha256(source.read_bytes()).hexdigest())

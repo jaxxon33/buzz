@@ -193,6 +193,9 @@ def start(image):
         if record.get('family') == 'claude':
             import claude_profile
             return claude_profile.start(sys.modules[__name__], image)
+        if record.get('family') == 'agy':
+            import agy_profile
+            return agy_profile.start(sys.modules[__name__], image)
     required = {"BUZZ_PRIVATE_KEY", "BUZZ_RELAY_URL"}
     provider_name = os.environ.get("BUZZ_AGENT_PROVIDER")
     if provider_name == "openai":
@@ -472,7 +475,17 @@ def main():
     p.add_argument("--image", required=True, type=image_id)
     commands.add_parser('claude-login')
     commands.add_parser('claude-activate')
+    commands.add_parser('agy-login')
+    commands.add_parser('agy-activate')
     args = parser.parse_args()
+    if args.command in {'agy-login', 'agy-activate'}:
+        import agy_profile
+        controller = sys.modules[__name__]
+        if args.command == 'agy-login':
+            agy_profile.login(controller, args.agent)
+        else:
+            agy_profile.activate(controller, args.agent)
+        return
     if args.command in {'claude-login', 'claude-activate'}:
         import claude_profile
         controller = sys.modules[__name__]
