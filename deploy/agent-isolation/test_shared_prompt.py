@@ -147,6 +147,29 @@ class MountAudits(unittest.TestCase):
                     Memory=4 * 1024 ** 3, NanoCpus=2 * 10 ** 9, PidsLimit=512)
                 self.check(lambda: module.audit(pilot, pilot.NAME, IMAGE), data)
 
+    def test_agy_audit_with_and_without_the_ssh_grant(self):
+        pilot.configure_profile('synthetic', 62009, 'synthetic')
+        ssh = volume('/home/paul/.ssh', pilot.NAME + '-ssh', False)
+        base = [volume('/workspace', pilot.VOLUME, True), volume('/home/paul', pilot.NAME + '-home', True)]
+        cases = [
+            ('prompt-alone-no-grant', [PROMPT], False, True),
+            ('prompt-and-ssh-with-grant', [PROMPT, ssh], True, True),
+            ('ssh-without-grant', [PROMPT, ssh], False, False),
+            ('grant-without-ssh', [PROMPT], True, False),
+            ('other-bind-with-grant', [PROMPT, ssh, REJECTED['other-bind'][1]], True, False),
+        ]
+        for name, mounts, granted, passes in cases:
+            with self.subTest(name=name):
+                data = self.boundary(62009, base + mounts, Memory=4 * 1024 ** 3,
+                                     NanoCpus=2 * 10 ** 9, PidsLimit=512)
+                with mock.patch.object(pilot, 'docker', return_value=subprocess.CompletedProcess(
+                        [], 0, stdout=json.dumps([data]))):
+                    if passes:
+                        agy_profile.audit(pilot, pilot.NAME, IMAGE, ssh=granted)
+                    else:
+                        with self.assertRaises(ValueError):
+                            agy_profile.audit(pilot, pilot.NAME, IMAGE, ssh=granted)
+
 
 class LaunchPaths(unittest.TestCase):
     def test_every_production_launch_path_adds_the_prompt_mount(self):
