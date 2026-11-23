@@ -181,7 +181,12 @@ Activation is host-side and requires access to the existing user service manager
 and Docker. Check that the pilot is idle before stopping it. Keep the existing
 service's environment file in place; the controller forwards an explicit list
 of only that agent's settings, using variable **names**, not values, in argv.
-Its HOME, PATH, commands and base-prompt paths come from the image. No credentials
+Its HOME, PATH and commands come from the image. The base prompt comes from
+`/home/paul/.config/buzz-shared-prompt/base-prompt.md`, bind-mounted read-only at
+`/opt/buzz/shared` on every live launch, so editing that one real file reaches an
+agent on its next restart without a rebuild. Replace it by rename; never symlink
+it. If the directory or file is missing, empty or a symlink, the launch keeps the
+image's baked prompt and logs a warning. No credentials
 are printed or written to a new file by this controller. The host resolves the
 configured relay hostname at each launch. Because Tailscale binds its listener
 to its own interface, the host forwards opaque TCP bytes from an ephemeral

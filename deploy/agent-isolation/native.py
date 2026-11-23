@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 import pilot
 import workspace
 import hive_secrets
+import shared_prompt
 import native_sandbox
 
 CODEX_SANDBOX = False
@@ -97,7 +98,7 @@ def audit(name, prefix=None):
     }
     if pilot.AGENT == 'claude-opus':
         expected.add(('/home/paul/.config/desktop-mcp', prefix + '-desktop', False))
-    mounts = hive_secrets.audit_mounts(data['Mounts'], pilot.AGENT)
+    mounts = shared_prompt.audit_mounts(hive_secrets.audit_mounts(data['Mounts'], pilot.AGENT))
     actual = {(m['Destination'], m.get('Name'), m['RW']) for m in mounts if m['Type'] != 'tmpfs'}
     if actual != expected or any(m['Type'] not in {'volume', 'tmpfs'} for m in mounts):
         raise ValueError('Unexpected native mount authority')
@@ -138,6 +139,7 @@ def start(image, volume_prefix=None):
                           capture_output=True, text=True).stdout.strip()
     with ExitStack() as cleanup:
         args += cleanup.enter_context(hive_secrets.delivery(pilot.AGENT, pilot.NAME))
+        args += shared_prompt.launch_args()
         tunnel = cleanup.enter_context(pilot.Tunnel((bridge, 0), (address, 443)))
         port = tunnel.start()
         cleanup.callback(tunnel.shutdown)
