@@ -112,10 +112,17 @@ class AgyProfile(unittest.TestCase):
                 source.write_text(original + key + '=must-not-be-forwarded\n')
                 with self.subTest(key=key), self.assertRaises(ValueError):
                     provision.read_environment(source)
-            for model in ['neon', 'auto', 'claude-fable-5-2', 'gemini']:
+            for model in ['neon', 'auto', 'gemini', 'claude', 'gpt-5', 'gpt-oss', 'opus-5-5-medium',
+                          'claude-opus-5-5[1m]', 'Claude-Opus-5-5-medium']:
                 source.write_text(original.replace(MODEL, model))
                 with self.subTest(model=model), self.assertRaises(ValueError):
                     provision.read_environment(source)
+            # The same Google plan offers Claude and GPT-OSS models through agy.
+            for model in ['claude-opus-5-5-medium', 'claude-sonnet-5-5-high', 'gpt-oss-120b-medium',
+                          'gemini-3.8-flash']:
+                source.write_text(original.replace(MODEL, model))
+                with self.subTest(model=model):
+                    self.assertEqual(provision.read_environment(source)['BUZZ_ACP_MODEL'], model)
             source.write_text(original.replace('BUZZ_ACP_AGENT_ARGS=acp', 'BUZZ_ACP_AGENT_ARGS=--dangerously-skip-permissions'))
             with self.assertRaises(ValueError):
                 provision.read_environment(source)

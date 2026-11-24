@@ -112,6 +112,8 @@ credentials. That test does not prove subscription access or Fable generation.
 
 `BUZZ_ACP_AGENT_COMMAND=agy` (optionally `BUZZ_ACP_AGENT_ARGS=acp`) with an
 explicit `BUZZ_ACP_MODEL` such as `gemini-4-neon-medium` selects the agy family.
+Claude (`claude-opus-5-5-medium`) and GPT-OSS (`gpt-oss-120b-medium`) IDs offered by
+the same Google plan are accepted too; activation still requires the login to offer the exact model.
 Use the credential-free image labelled `buzz.isolation.native=agy`, built with
 `native_build.py --family agy --agy-sha512 <verified release digest>` (no Node
 stage; the adapter is `agy acp --disable-telemetry`). Gemini API keys, Vertex,

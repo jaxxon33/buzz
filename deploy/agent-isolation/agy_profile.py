@@ -58,7 +58,8 @@ SSH_CONFIG = """Host *
 Host ag
     HostName 100.109.21.86
 """
-MODEL = re.compile(r'gemini-[a-z0-9]+(?:[-.][a-z0-9]+){1,15}')
+# Gemini plus the Claude/GPT-OSS models the same Google plan offers through agy.
+MODEL = re.compile(r'(?:gemini|claude|gpt-oss)-[a-z0-9]+(?:[-.][a-z0-9]+){1,15}')
 
 
 def validate_environment(values):
@@ -67,7 +68,7 @@ def validate_environment(values):
     if not all(values.get(key) for key in ['BUZZ_PRIVATE_KEY', 'BUZZ_RELAY_URL', 'BUZZ_ACP_MODEL']):
         raise ValueError('agy profiles require their own Buzz identity, relay and explicit model')
     if len(values['BUZZ_ACP_MODEL']) > 96 or not MODEL.fullmatch(values['BUZZ_ACP_MODEL']):
-        raise ValueError('Use an explicit Gemini model ID, such as gemini-4-neon-medium')
+        raise ValueError('Use an explicit agy model ID, such as gemini-4-neon-medium or claude-opus-5-5-medium')
     if values.get('BUZZ_ACP_AGENT_ARGS', '') not in {'', 'acp'}:
         raise ValueError('agy profiles run only the pinned image adapter (agy acp)')
 
