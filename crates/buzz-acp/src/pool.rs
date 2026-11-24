@@ -1117,6 +1117,34 @@ impl AgentPool {
         self.agents.iter().any(|slot| slot.is_some())
     }
 
+    /// Answer agent-initiated traffic on every idle worker.
+    ///
+    /// See [`AcpClient::service_idle`]. A worker whose pipe fails here is
+    /// dropped from its slot so maintenance refill respawns it, the same
+    /// recovery an in-turn failure gets.
+    pub async fn service_idle_agents(&mut self) {
+        for slot in self.agents.iter_mut() {
+            let Some(agent) = slot.as_mut() else {
+                continue;
+            };
+            match agent.acp.service_idle().await {
+                Ok(0) => {}
+                Ok(handled) => tracing::debug!(
+                    agent = agent.index,
+                    handled,
+                    "serviced agent traffic between turns"
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        agent = agent.index,
+                        "idle agent failed between turns: {e} — dropping for refill"
+                    );
+                    *slot = None;
+                }
+            }
+        }
+    }
+
     /// Confirm that pending work for `scope` successfully claimed a worker.
     ///
     /// In particular, an expired busy-owner hold must not be consumed until

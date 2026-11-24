@@ -71,6 +71,9 @@ fn is_subcommand(name: &str) -> bool {
     std::env::args().nth(1).map(|a| a == name).unwrap_or(false)
 }
 
+/// How often idle workers are checked for traffic sent between turns.
+const IDLE_SERVICE_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Timeout for lightweight helper subcommands (spawn + initialize + model/method probes).
 const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -3226,7 +3229,15 @@ async fn run_harness(
         Wake(u32, Result<AgentPool, String>),
         HoldDeadline,
         Recovery(recovery_wake::RecoveryWake),
+        /// Time to answer traffic idle workers sent between turns.
+        IdleService,
     }
+
+    // Idle workers are otherwise unread between turns; see
+    // `AcpClient::service_idle`. Delay (not Burst) so a slow pass never
+    // triggers a catch-up storm.
+    let mut idle_service_tick = tokio::time::interval(IDLE_SERVICE_INTERVAL);
+    idle_service_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         // Whether buffered work is waiting on a lazy pool. Also gates the
@@ -3334,6 +3345,7 @@ async fn run_harness(
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
         pool.retain_held_scopes(|scope| queue.has_pending_scope(scope));
         let hold_deadline = pool.next_hold_deadline(pool::HOLD_BUSY_OWNER_TIMEOUT);
+        let idle_service_due = pool_ready && pool.any_idle();
         let pool_event: Option<PoolEvent> = {
             let (result_rx, join_set) = pool.rx_and_join_set();
             tokio::select! {
@@ -3385,6 +3397,9 @@ async fn run_harness(
                 } => None,
                 _ = pool::AgentPool::wait_for_hold_deadline(hold_deadline), if pool_ready => {
                     Some(PoolEvent::HoldDeadline)
+                },
+                _ = idle_service_tick.tick(), if idle_service_due => {
+                    Some(PoolEvent::IdleService)
                 },
                 Some(Err(error)) = wake_tasks.join_next(), if !wake_tasks.is_empty() => {
                     if let Some(attempt) = pool_lifecycle.waking_attempt() {
@@ -4258,6 +4273,9 @@ async fn run_harness(
                         );
                     }
                 }
+            }
+            Some(PoolEvent::IdleService) => {
+                pool.service_idle_agents().await;
             }
             Some(PoolEvent::HoldDeadline) => {
                 // A held thread must make progress even when every unrelated

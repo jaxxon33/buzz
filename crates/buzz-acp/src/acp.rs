@@ -141,6 +141,9 @@ fn build_initialize_params() -> serde_json::Value {
     })
 }
 
+/// Upper bound on messages drained per [`AcpClient::service_idle`] call.
+const IDLE_SERVICE_MAX_MESSAGES: usize = 256;
+
 /// ACP client that owns an agent subprocess and communicates over its stdio.
 ///
 /// One `AcpClient` per agent process. Multiple sessions can be created on the
@@ -2088,6 +2091,89 @@ impl AcpClient {
         Ok(())
     }
 
+    /// Service agent-initiated traffic while no turn is in flight.
+    ///
+    /// The harness reads the agent's stdout only inside a request, so anything
+    /// an agent sends between turns sits unread. An agent that wakes itself
+    /// (for example when a backgrounded command finishes) then blocks on a
+    /// `session/request_permission` nobody answers until the next relay event
+    /// starts a turn. This drains whatever is already buffered without
+    /// waiting: permission requests get the same auto-approval as in-turn
+    /// requests, `session/update` notifications are handled as usual, and any
+    /// other agent request gets a JSON-RPC -32601 so it never hangs.
+    ///
+    /// Returns the number of messages handled. Never waits on an empty pipe.
+    pub async fn service_idle(&mut self) -> Result<usize, AcpError> {
+        use futures_util::FutureExt;
+        let mut handled = 0usize;
+        // Bounded so one chatty agent cannot starve the main loop.
+        while handled < IDLE_SERVICE_MAX_MESSAGES {
+            let line = match self.reader.next().now_or_never() {
+                None => break,
+                Some(None) => return Err(AcpError::AgentExited),
+                Some(Some(Err(LinesCodecError::MaxLineLengthExceeded))) => {
+                    return Err(AcpError::Protocol(
+                        "agent stdout line exceeded 10MB limit".into(),
+                    ));
+                }
+                Some(Some(Err(e))) => return Err(AcpError::Io(std::io::Error::other(e))),
+                Some(Some(Ok(line))) => line,
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            handled += 1;
+            tracing::debug!(target: "acp::wire", "← (idle) {trimmed}");
+            let msg: serde_json::Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "acp::wire",
+                        "failed to parse idle line as JSON: {e} — skipping"
+                    );
+                    continue;
+                }
+            };
+            self.observe("acp_read", msg.clone());
+            let Some(method) = msg.get("method").and_then(|v| v.as_str()) else {
+                // A late response to an earlier request; nothing awaits it.
+                tracing::debug!(target: "acp::wire", "ignoring idle response");
+                continue;
+            };
+            match method {
+                "session/update" => {
+                    let _ = self.handle_session_update(&msg);
+                }
+                "_goose/unstable/session/update" => {
+                    self.handle_goose_usage_update(&msg);
+                }
+                "session/request_permission" => {
+                    tracing::info!(
+                        target: "acp::permission",
+                        "agent requested permission between turns; answering"
+                    );
+                    self.handle_permission_request(&msg).await?;
+                    // No prompt is in flight, so nothing can cancel this one.
+                    self.pending_permission_id = None;
+                    self.permission_responded = false;
+                }
+                other => {
+                    if msg.get("id").is_some() {
+                        let err_resp = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": msg["id"],
+                            "error": {"code": -32601, "message": format!("Method not found: {other}")}
+                        });
+                        self.write_ndjson(&err_resp).await?;
+                    }
+                    tracing::debug!(target: "acp::wire", "ignoring idle method: {other}");
+                }
+            }
+        }
+        Ok(handled)
+    }
+
     /// Parse a completed prompt response and retain its optional per-turn usage.
     fn parse_prompt_response(
         &mut self,
@@ -3196,6 +3282,117 @@ mod tests {
             msg.contains("Hard turn timeout"),
             "HardTimeout display: {msg}"
         );
+    }
+
+    /// Call `service_idle` until it handles `want` messages or 5s pass.
+    async fn service_idle_until(client: &mut AcpClient, want: usize) -> usize {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut total = 0;
+        while total < want && tokio::time::Instant::now() < deadline {
+            total += client.service_idle().await.expect("service_idle");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        total
+    }
+
+    /// An agent that wakes itself between turns and asks for permission must
+    /// get an answer without waiting for the next prompt (Neon, 2026-11-24).
+    #[tokio::test]
+    async fn service_idle_answers_permission_request_between_turns() {
+        let out = std::env::temp_dir().join(format!(
+            "buzz-acp-idle-perm-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            r#"echo '{{"jsonrpc":"2.0","id":"perm-7","method":"session/request_permission","params":{{"sessionId":"s","toolCall":{{"toolCallId":"t"}},"options":[{{"optionId":"go","kind":"allow_once","name":"Allow"}},{{"optionId":"no","kind":"reject_once","name":"Reject"}}]}}}}'; read -r line; printf '%s' "$line" > '{}'; sleep 10"#,
+            out.display()
+        );
+        let mut client = spawn_script(&script).await;
+        assert_eq!(service_idle_until(&mut client, 1).await, 1);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reply = loop {
+            if let Ok(text) = std::fs::read_to_string(&out) {
+                if !text.is_empty() {
+                    break text;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "agent never got a permission reply"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        let _ = std::fs::remove_file(&out);
+        let reply: serde_json::Value = serde_json::from_str(&reply).expect("reply is JSON");
+        assert_eq!(reply["id"], "perm-7");
+        assert_eq!(reply["result"]["outcome"]["optionId"], "go");
+        // Nothing is in flight, so no stale permission state may leak into the next turn.
+        assert!(client.pending_permission_id.is_none());
+        assert!(!client.permission_responded);
+    }
+
+    /// Between-turn notifications are consumed, and unknown agent requests get
+    /// -32601 instead of hanging.
+    #[tokio::test]
+    async fn service_idle_drains_updates_and_rejects_unknown_requests() {
+        let out = std::env::temp_dir().join(format!(
+            "buzz-acp-idle-unknown-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            r#"echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"agent_message_chunk","content":{{"text":"woke"}}}}}}}}'; echo '{{"jsonrpc":"2.0","id":9,"method":"x/unknown","params":{{}}}}'; read -r line; printf '%s' "$line" > '{}'; sleep 10"#,
+            out.display()
+        );
+        let mut client = spawn_script(&script).await;
+        assert_eq!(service_idle_until(&mut client, 2).await, 2);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reply = loop {
+            if let Ok(text) = std::fs::read_to_string(&out) {
+                if !text.is_empty() {
+                    break text;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "agent never got an error reply"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        let _ = std::fs::remove_file(&out);
+        let reply: serde_json::Value = serde_json::from_str(&reply).expect("reply is JSON");
+        assert_eq!(reply["id"], 9);
+        assert_eq!(reply["error"]["code"], -32601);
+    }
+
+    /// A quiet agent costs nothing: `service_idle` returns at once.
+    #[tokio::test]
+    async fn service_idle_returns_immediately_on_quiet_agent() {
+        let mut client = spawn_script("sleep 10").await;
+        let started = std::time::Instant::now();
+        assert_eq!(client.service_idle().await.expect("service_idle"), 0);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    /// An agent that died between turns is reported so the pool can refill it.
+    #[tokio::test]
+    async fn service_idle_reports_exited_agent() {
+        let mut client = spawn_script("exit 0").await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match client.service_idle().await {
+                Err(AcpError::AgentExited) => break,
+                Ok(_) => {}
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "exit never observed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     async fn spawn_script(script: &str) -> AcpClient {
