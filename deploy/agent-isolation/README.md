@@ -108,6 +108,29 @@ usable agent. `CLAUDE_NEW_IMAGE` enables the full-package real fresh-home/UID/
 policy/unauthenticated-CLI journey, using synthetic configuration and no real
 credentials. That test does not prove subscription access or Fable generation.
 
+### New agy (Antigravity CLI / Gemini) workers with their own login
+
+`BUZZ_ACP_AGENT_COMMAND=agy` (optionally `BUZZ_ACP_AGENT_ARGS=acp`) with an
+explicit `BUZZ_ACP_MODEL` such as `gemini-4-neon-medium` selects the agy family.
+Claude (`claude-opus-5-5-medium`) and GPT-OSS (`gpt-oss-120b-medium`) IDs offered by
+the same Google plan are accepted too; activation still requires the login to offer the exact model.
+Use the credential-free image labelled `buzz.isolation.native=agy`, built with
+`native_build.py --family agy --agy-sha512 <verified release digest>` (no Node
+stage; the adapter is `agy acp --disable-telemetry`). Gemini API keys, Vertex,
+ADC, Google Cloud project variables and every other provider's auth are refused.
+No D-Bus or keyring is reachable, so agy keeps its Google login as a file in the
+private login-home volume.
+
+Preparation stops at `awaiting-login`. In the owner's own terminal run the
+pinned controller with `--agent NAME agy-login`: the official `agy acp --login`
+prints a Google URL and reads the pasted code in that terminal only. Then
+`--agent NAME agy-activate` requires an authenticated ACP `session/new` that
+offers the exact model, runs the same real model/MCP/file/Git probe as the
+Claude family, independently re-reads the result, audits the launch and only
+then enables the unit. The model is not pinned by a managed policy inside agy:
+`run` refuses to start when the environment model differs from the verified
+profile record, and Hive refuses model edits for this family.
+
 ### Migrating existing pilots
 
 The supported pilots are Gemma (UID/GID 61021) and Fizz (UID/GID 61022). Each has
@@ -160,7 +183,12 @@ Activation is host-side and requires access to the existing user service manager
 and Docker. Check that the pilot is idle before stopping it. Keep the existing
 service's environment file in place; the controller forwards an explicit list
 of only that agent's settings, using variable **names**, not values, in argv.
-Its HOME, PATH, commands and base-prompt paths come from the image. No credentials
+Its HOME, PATH and commands come from the image. The base prompt comes from
+`/home/paul/.config/buzz-shared-prompt/base-prompt.md`, bind-mounted read-only at
+`/opt/buzz/shared` on every live launch, so editing that one real file reaches an
+agent on its next restart without a rebuild. Replace it by rename; never symlink
+it. If the directory or file is missing, empty or a symlink, the launch keeps the
+image's baked prompt and logs a warning. No credentials
 are printed or written to a new file by this controller. The host resolves the
 configured relay hostname at each launch. Because Tailscale binds its listener
 to its own interface, the host forwards opaque TCP bytes from an ephemeral

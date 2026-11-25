@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 from relay_tunnel import Tunnel
 import workspace
 import hive_secrets
+import shared_prompt
 
 NAME = "buzz-isolated-gemma"
 VOLUME = NAME + "-workspace"
@@ -193,6 +194,9 @@ def start(image):
         if record.get('family') == 'claude':
             import claude_profile
             return claude_profile.start(sys.modules[__name__], image)
+        if record.get('family') == 'agy':
+            import agy_profile
+            return agy_profile.start(sys.modules[__name__], image)
     required = {"BUZZ_PRIVATE_KEY", "BUZZ_RELAY_URL"}
     provider_name = os.environ.get("BUZZ_AGENT_PROVIDER")
     if provider_name == "openai":
@@ -245,6 +249,7 @@ def start(image):
     # A second hop inside the worker retains the original relay URL and TLS name.
     with ExitStack() as cleanup:
         args += cleanup.enter_context(hive_secrets.delivery(AGENT, NAME))
+        args += shared_prompt.launch_args()
         tunnel = cleanup.enter_context(Tunnel((bridge, 0), (address, 443)))
         port = tunnel.start()
         cleanup.callback(tunnel.shutdown)
@@ -472,7 +477,20 @@ def main():
     p.add_argument("--image", required=True, type=image_id)
     commands.add_parser('claude-login')
     commands.add_parser('claude-activate')
+    commands.add_parser('agy-login')
+    commands.add_parser('agy-activate')
+    commands.add_parser('agy-ssh-grant')
     args = parser.parse_args()
+    if args.command in {'agy-login', 'agy-activate', 'agy-ssh-grant'}:
+        import agy_profile
+        controller = sys.modules[__name__]
+        if args.command == 'agy-login':
+            agy_profile.login(controller, args.agent)
+        elif args.command == 'agy-ssh-grant':
+            agy_profile.ssh_grant(controller, args.agent)
+        else:
+            agy_profile.activate(controller, args.agent)
+        return
     if args.command in {'claude-login', 'claude-activate'}:
         import claude_profile
         controller = sys.modules[__name__]
